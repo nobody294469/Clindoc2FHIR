@@ -73,6 +73,10 @@ def _make_verification(
     )
 
 
+class ReviewedClaim(Claim):
+    review_state: str | None = None
+
+
 def _make_claim(
     claim_id: str,
     field_type: str,
@@ -85,8 +89,10 @@ def _make_claim(
     temporal_status: str = "current",
     group_id: str = "grp-42-1",
     evidence_id: str = "ev-42-1",
+    review_state: str | None = None,
 ) -> Claim:
-    return Claim(
+    cls = ReviewedClaim if review_state is not None else Claim
+    kwargs: dict[str, Any] = dict(
         claim_id=claim_id,
         document_id="DOC-42-001",
         group_id=group_id,
@@ -103,6 +109,9 @@ def _make_claim(
         evidence_id=evidence_id,
         region_id="R1",
     )
+    if review_state is not None:
+        kwargs["review_state"] = review_state
+    return cls(**kwargs)
 
 
 # ─── 1. OBSERVATION LIFECYCLE TESTS ──────────────────────────────────────────
@@ -170,7 +179,7 @@ def test_supported_claim_in_explicitly_preliminary_report_remains_preliminary():
 
 
 def test_discrepancy_claim_in_explicitly_final_report_remains_final():
-    """A DISCREPANCY claim in an explicitly final report remains final in Observation.status."""
+    """A DISCREPANCY claim is suppressed autonomously, but if accepted by human review retains final status."""
     ev = _make_evidence(text="Report Status: Final\nSodium: 138 mEq/L")
     claims = [
         _make_claim("c-val", "lab.value", "138", value_numeric=138.0, unit_raw="mEq/L"),
@@ -183,14 +192,30 @@ def test_discrepancy_claim_in_explicitly_final_report_remains_final():
         "c-name": _make_verification("c-name", ev_id=ev.evidence_id, label="SUPPORTED", confidence=0.95),
     }
 
+    # Autonomous pipeline: unverified / discrepancy claim must be suppressed
     bundle = claims_to_fhir_bundle(
         claims,
         ev_map,
         ver_map,
         document_metadata={"report_status": "final"},
     )
-    obs = next(e.resource for e in bundle.entry if isinstance(e.resource, Observation))
-    assert obs.status == "final", "DISCREPANCY verdict must NOT alter grounded final report lifecycle"
+    assert not any(isinstance(e.resource, Observation) for e in bundle.entry), (
+        "DISCREPANCY claim must be suppressed from autonomous FHIR bundle despite final report status"
+    )
+
+    # Human-reviewed pipeline: accepted discrepancy claim retains final lifecycle status
+    claims_reviewed = [
+        _make_claim("c-val", "lab.value", "138", value_numeric=138.0, unit_raw="mEq/L", review_state="ACCEPTED"),
+        _make_claim("c-name", "lab.test_name", "Sodium", normalized_code="2951-2", code_system="LOINC", review_state="ACCEPTED"),
+    ]
+    bundle_reviewed = claims_to_fhir_bundle(
+        claims_reviewed,
+        ev_map,
+        ver_map,
+        document_metadata={"report_status": "final"},
+    )
+    obs = next(e.resource for e in bundle_reviewed.entry if isinstance(e.resource, Observation))
+    assert obs.status == "final", "Accepted DISCREPANCY claim must retain grounded final report lifecycle"
 
 
 def test_bare_narrative_with_supported_verdict_remains_unknown():
@@ -478,24 +503,32 @@ def test_unspecified_temporal_status_omits_extension():
 # ─── 3. MEDICATION LIFECYCLE & TEMPORAL TESTS ────────────────────────────────
 
 def test_medication_discontinued_must_not_be_active():
-    """Discontinued medications must map to stopped status (never active)."""
-    ev = _make_evidence(text="Discontinue Lisinopril 20 mg oral daily.")
-    claims = [
-        _make_claim("c-med-name", "med.name", "Lisinopril", normalized_code="29046", code_system="RxNorm", temporal_status="discontinued"),
-        _make_claim("c-med-dose", "med.dose", "20", value_numeric=20.0, unit_raw="mg", temporal_status="discontinued"),
+    """Discontinued medications must map to stopped/cancelled status (never active)."""
+    # 1. Statement routing (discharge_summary) with patient cessation evidence
+    ev_stat = _make_evidence(text="Patient stopped taking Lisinopril 20 mg oral daily.")
+    claims_stat = [
+        _make_claim("c-med-name-1", "med.name", "Lisinopril", normalized_code="29046", code_system="RxNorm", temporal_status="discontinued"),
+        _make_claim("c-med-dose-1", "med.dose", "20", value_numeric=20.0, unit_raw="mg", temporal_status="discontinued"),
     ]
-    ev_map = {ev.evidence_id: ev}
-    ver_map = {c.claim_id: _make_verification(c.claim_id, ev_id=ev.evidence_id) for c in claims}
+    ev_map_stat = {ev_stat.evidence_id: ev_stat}
+    ver_map_stat = {c.claim_id: _make_verification(c.claim_id, ev_id=ev_stat.evidence_id) for c in claims_stat}
 
-    # 1. Statement routing (discharge_summary)
-    bundle_stat = claims_to_fhir_bundle(claims, ev_map, ver_map, document_type="discharge_summary")
+    bundle_stat = claims_to_fhir_bundle(claims_stat, ev_map_stat, ver_map_stat, document_type="discharge_summary")
     ms = next(e.resource for e in bundle_stat.entry if isinstance(e.resource, MedicationStatement))
-    assert ms.status == "stopped", "Discontinued MedicationStatement must have status='stopped'"
+    assert ms.status == "stopped", "Discontinued MedicationStatement with patient cessation must have status='stopped'"
 
-    # 2. Request routing (clinic_rx_pad)
-    bundle_req = claims_to_fhir_bundle(claims, ev_map, ver_map, document_type="clinic_rx_pad")
+    # 2. Request routing (clinic_rx_pad) with linked order cancellation evidence
+    ev_req = _make_evidence(text="Discontinue previous Rx #1234 Lisinopril 20 mg oral daily.")
+    claims_req = [
+        _make_claim("c-med-name-2", "med.name", "Lisinopril", normalized_code="29046", code_system="RxNorm", temporal_status="discontinued"),
+        _make_claim("c-med-dose-2", "med.dose", "20", value_numeric=20.0, unit_raw="mg", temporal_status="discontinued"),
+    ]
+    ev_map_req = {ev_req.evidence_id: ev_req}
+    ver_map_req = {c.claim_id: _make_verification(c.claim_id, ev_id=ev_req.evidence_id) for c in claims_req}
+
+    bundle_req = claims_to_fhir_bundle(claims_req, ev_map_req, ver_map_req, document_type="clinic_rx_pad")
     mr = next(e.resource for e in bundle_req.entry if isinstance(e.resource, MedicationRequest))
-    assert mr.status == "stopped", "Discontinued MedicationRequest must have status='stopped'"
+    assert mr.status == "cancelled", "Discontinued MedicationRequest with linked order cancellation must have status='cancelled'"
 
 
 def test_historical_medication_statement_status_is_unknown_not_completed():

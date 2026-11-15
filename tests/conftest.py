@@ -5,8 +5,12 @@ This ensures legacy test fixtures supply human-review acceptance metadata withou
 requiring caller-detection, inspect frames, or stack inspection in production services.
 """
 
+import os
 from typing import Any
 import pytest
+
+# Ensure local test and offline evaluation runs default safely to dev profile
+os.environ.setdefault("CLINDOC_PROFILE", "dev")
 
 
 def _apply_phase4_fixture_adaptations() -> None:

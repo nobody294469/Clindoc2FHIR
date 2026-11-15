@@ -79,10 +79,17 @@ from clindoc.services.fhir_export import (
 @pytest.fixture
 def db_session() -> Session:
     """In-memory SQLite database session initialized with all tables."""
-    engine = create_engine("sqlite:///:memory:", echo=False)
+    from sqlalchemy.pool import StaticPool
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        echo=False,
+    )
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(bind=engine, autoflush=False)
     session = SessionLocal()
+    session.session_factory = SessionLocal
     yield session
     session.close()
 

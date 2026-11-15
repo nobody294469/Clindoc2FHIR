@@ -127,10 +127,12 @@ def test_metadata_ddl_compilation(db_session: Session):
         "fhir_bundles",
         "fhir_exports",
         "audit_events",
+        "ehr_transmission_reconciliations",
+        "fhir_export_migration_audit",
+        "ehr_transmission_outbox",
     }
     compiled_tables = set(Base.metadata.tables.keys())
-    assert expected_tables.issubset(compiled_tables)
-    assert len(compiled_tables) == 18
+    assert expected_tables == compiled_tables
 
 
 # ---------------------------------------------------------------------------

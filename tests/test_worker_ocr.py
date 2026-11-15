@@ -213,7 +213,7 @@ def test_ocr_stage_confidence_aggregation_when_available(
     db_session.commit()
 
     # Create mock ingest function returning tokens with OCR confidence
-    def mock_scanned_ingest(path, document_id, source_type, is_tabular):
+    def mock_scanned_ingest(path, document_id, source_type, is_tabular, **kwargs):
         tokens = [
             Token(
                 text="Word1",
@@ -358,7 +358,7 @@ def test_ocr_stage_transient_failure_invokes_retry_queue_mechanism(
     job = queue.enqueue(session=db_session, document_id=doc.id, max_attempts=3)
     db_session.commit()
 
-    def failing_ingest(path, document_id, source_type, is_tabular):
+    def failing_ingest(path, document_id, source_type, is_tabular, **kwargs):
         raise ConnectionResetError("Transient OCR socket error")
 
     worker = DocumentProcessingWorker(
@@ -424,7 +424,7 @@ def test_ocr_stage_transient_failure_terminal_when_attempts_exhausted(
     job = queue.enqueue(session=db_session, document_id=doc.id, max_attempts=1)
     db_session.commit()
 
-    def failing_ingest(path, document_id, source_type, is_tabular):
+    def failing_ingest(path, document_id, source_type, is_tabular, **kwargs):
         raise TimeoutError("OCR timeout")
 
     worker = DocumentProcessingWorker(
@@ -490,7 +490,7 @@ def test_ocr_stage_temporary_file_cleaned_up_on_ocr_failure(
     job = queue.enqueue(session=db_session, document_id=doc.id)
     db_session.commit()
 
-    def failing_ingest(path, document_id, source_type, is_tabular):
+    def failing_ingest(path, document_id, source_type, is_tabular, **kwargs):
         raise UnreadableDocumentError("Simulated unreadable document during ingestion")
 
     worker = DocumentProcessingWorker(

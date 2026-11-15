@@ -27,6 +27,7 @@ from clindoc.db.enums import (
     DocumentApprovalStatus,
     DocumentStatus,
     FHIRExportStatus,
+    IdentityVerificationStatus,
     PatientIdentityApprovalStatus,
     VerificationLabel,
     VerificationStage,
@@ -669,6 +670,10 @@ def test_database_export_enforces_four_eyes_approval_gate(sqlite_session: Sessio
     approval.approval_status = DocumentApprovalStatus.APPROVED
     approval.patient_identity_status = PatientIdentityApprovalStatus.CONFIRMED
     approval.is_export_eligible = True
+    doc.status = DocumentStatus.APPROVED
+    doc.identity_verification_status = IdentityVerificationStatus.CONFIRMED
+    doc.identity_confirmed_by = user_id
+    doc.patient_context_id = "MRN-12345"
     sqlite_session.flush()
 
     # Now export succeeds
@@ -701,6 +706,16 @@ def test_api_export_and_get_bundle_endpoints(sqlite_session: Session):
 
     doc_id = uuid.uuid4()
     user_id = uuid.uuid4()
+    uploader_id = uuid.uuid4()
+
+    uploader = User(
+        id=uploader_id,
+        idp_subject="sub-user-uploader",
+        username="uploader_01",
+        full_name="Dr. Uploader",
+        email="uploader@hospital.org",
+    )
+    sqlite_session.add(uploader)
 
     user = User(
         id=user_id,
@@ -713,9 +728,12 @@ def test_api_export_and_get_bundle_endpoints(sqlite_session: Session):
 
     doc = DBDocument(
         id=doc_id,
-        uploaded_by=user_id,
+        uploaded_by=uploader_id,
         source_type="scanned_pdf",
         status=DocumentStatus.APPROVED,
+        identity_verification_status=IdentityVerificationStatus.CONFIRMED,
+        identity_confirmed_by=user_id,
+        patient_context_id="MRN-12345",
         original_filename="lab_api.pdf",
         storage_ref="blobs/test/lab_api.pdf",
         mime_type="application/pdf",

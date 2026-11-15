@@ -1383,3 +1383,88 @@ def test_postgresql_deadlock_free_concurrent_batches(pg_cluster: str):
     # but CRITICALLY no PostgreSQL deadlock error ("deadlock detected") occurs!
     for worker_name, exc in errors:
         assert "deadlock detected" not in str(exc).lower(), f"Deadlock occurred in {worker_name}: {exc}"
+
+
+def test_postgresql_batch_review_vs_single_edit_no_deadlock(pg_cluster: str):
+    """
+    Real PostgreSQL concurrency regression test:
+    Verify that concurrent execution of batch_review_claims() and single-claim edit_claim()
+    on the same document does NOT cause a PostgreSQL deadlock (40P01).
+    Because batch_review_claims() acquires document-scoped advisory locks BEFORE acquiring
+    row-level SELECT ... FOR UPDATE on claim roots, the universal lock hierarchy
+    (Document Advisory Lock -> Claim Genesis Row Lock) is strictly preserved.
+    """
+    engine = create_engine(pg_cluster, pool_size=10, max_overflow=5)
+    Base.metadata.create_all(engine)
+    SessionMaker = sessionmaker(bind=engine)
+
+    # Seed Document with two genesis claims
+    with SessionMaker() as s:
+        seed_default_triage_policy(s)
+        op = _seed_user(s, "batch_vs_single_op", role="pipeline_operator")
+        doc = _seed_document(s, op)
+        ev = _seed_evidence(s, doc)
+        ca = _seed_genesis_claim(s, doc, ev, value="Claim A")
+        cb = _seed_genesis_claim(s, doc, ev, value="Claim B")
+        u1 = _seed_user(s, "batch_user_u1")
+        u2 = _seed_user(s, "single_user_u2")
+        s.commit()
+
+        ca_id = ca.id
+        cb_id = cb.id
+        u1_id = u1.id
+        u2_id = u2.id
+
+    svc = ClaimReviewService(enforce_four_eyes=True)
+    svc.strict_lifecycle = True
+
+    errors = []
+    ready_barrier = threading.Barrier(2)
+
+    def run_batch_worker():
+        with SessionMaker() as sess_batch:
+            try:
+                ready_barrier.wait(timeout=5)
+                # Batch review covering [ca, cb]
+                svc.batch_review_claims(
+                    sess_batch,
+                    [
+                        {"action": "ACCEPT", "claim_id": ca_id, "expected_version": 1, "reason_code": "ACCEPT_A"},
+                        {"action": "ACCEPT", "claim_id": cb_id, "expected_version": 1, "reason_code": "ACCEPT_B"},
+                    ],
+                    actor_id=u1_id,
+                    commit=True,
+                )
+            except Exception as exc:
+                errors.append(("Batch Worker", exc))
+
+    def run_single_edit_worker():
+        with SessionMaker() as sess_single:
+            try:
+                ready_barrier.wait(timeout=5)
+                # Single edit on cb
+                svc.edit_claim(
+                    session=sess_single,
+                    claim_id=cb_id,
+                    actor_id=u2_id,
+                    new_value="Edited Value for Claim B",
+                    reason_code="EDIT_B",
+                    expected_version=1,
+                    commit=True,
+                )
+            except Exception as exc:
+                errors.append(("Single Edit Worker", exc))
+
+    th_batch = threading.Thread(target=run_batch_worker)
+    th_single = threading.Thread(target=run_single_edit_worker)
+
+    th_batch.start()
+    th_single.start()
+
+    th_batch.join(timeout=10)
+    th_single.join(timeout=10)
+
+    # Assert that neither worker suffered a PostgreSQL deadlock (40P01)
+    for worker_name, exc in errors:
+        assert "deadlock detected" not in str(exc).lower(), f"Deadlock occurred in {worker_name}: {exc}"
+

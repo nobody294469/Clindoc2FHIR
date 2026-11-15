@@ -506,7 +506,8 @@ def test_req44_duration_vs_monitoring_reassessment():
 
 
 def test_req44_paragraph_break_without_transition_fails_closed():
-    """Verify paragraph break (\\n\\n) without transition keyword fails closed against taper merging."""
+    """Verify paragraph break (\\n\\n) without transition keyword fails closed against taper merging.
+    Under M-FHIR-SAFE-SELECTION, unslotted incompatible doses (40 vs 20) fail closed entirely."""
     raw_text = "Prednisone 40 mg daily for 2 weeks.\n\nTake 20 mg daily for 2 weeks."
     ev = _make_evidence("ev-para", raw_text, page_number=1, char_start=0, char_end=len(raw_text))
 
@@ -523,11 +524,9 @@ def test_req44_paragraph_break_without_transition_fails_closed():
     ver_map = {c.claim_id: _make_verification(c.claim_id, c.evidence_id) for c in claims}
 
     bundle = claims_to_fhir_bundle(claims, ev_map, ver_map, document_type="clinic_rx_pad")
-    mr: MedicationRequest = next(e.resource for e in bundle.entry if isinstance(e.resource, MedicationRequest))
-
-    # Without transition keywords, does not synthesize sequential taper across paragraphs
-    assert len(mr.dosageInstruction) == 1
-    assert mr.dosageInstruction[0].sequence == 1
+    # Incompatible unslotted doses without transition fail closed; no MedicationRequest emitted
+    med_requests = [e.resource for e in bundle.entry if isinstance(e.resource, MedicationRequest)]
+    assert len(med_requests) == 0
 
 
 def test_req44_ocr_line_wrap_with_explicit_transition():

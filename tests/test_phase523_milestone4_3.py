@@ -349,14 +349,14 @@ def test_sequential_taper_missing_duration_does_not_invent_bounds():
 # ─── 3. CONFLICTING INSTRUCTIONS & DETERMINISTIC SLOTS ───────────────────────
 
 def test_conflicting_unslotted_doses_selects_deterministic_winner():
-    """When two conflicting doses exist without timing or taper cues, deterministic selection runs."""
-    raw_text = "Metformin 500 mg po daily. (Note elsewhere: Metformin 1000 mg po daily)."
+    """When two equivalent competing doses exist without timing cues, deterministic selection runs and shadows."""
+    raw_text = "Metformin 500 mg po daily. (Note elsewhere: Metformin 500.0 mg po daily)."
     ev = _make_evidence("ev-conflict", raw_text, 0, len(raw_text))
 
     claims = [
         _make_claim("c-name", "med.name", "Metformin", evidence_id="ev-conflict"),
         _make_claim("c-d1", "med.dose", "500", value_numeric=500.0, unit_raw="mg", evidence_id="ev-conflict", extraction_confidence=0.99),
-        _make_claim("c-d2", "med.dose", "1000", value_numeric=1000.0, unit_raw="mg", evidence_id="ev-conflict", extraction_confidence=0.80),
+        _make_claim("c-d2", "med.dose", "500.0", value_numeric=500.0, unit_raw="mg", evidence_id="ev-conflict", extraction_confidence=0.80),
         _make_claim("c-f", "med.frequency", "daily", evidence_id="ev-conflict"),
     ]
     ev_map = {"ev-conflict": ev}
@@ -372,6 +372,25 @@ def test_conflicting_unslotted_doses_selects_deterministic_winner():
     # Competing candidate shadowed
     comp_ext = next(ext for ext in mr.extension if ext.url == EXT_COMPETING_CANDIDATE)
     assert any(s.url == "competingClaimId" and s.valueString == "c-d2" for s in comp_ext.extension)
+
+
+def test_incompatible_unslotted_doses_fail_closed():
+    """When two incompatible doses exist without human review, selection fails closed (zero MedicationRequest)."""
+    raw_text = "Metformin 500 mg po daily. (Note elsewhere: Metformin 1000 mg po daily)."
+    ev = _make_evidence("ev-conflict-incompat", raw_text, 0, len(raw_text))
+
+    claims = [
+        _make_claim("c-name", "med.name", "Metformin", evidence_id="ev-conflict-incompat"),
+        _make_claim("c-d1", "med.dose", "500", value_numeric=500.0, unit_raw="mg", evidence_id="ev-conflict-incompat", extraction_confidence=0.99),
+        _make_claim("c-d2", "med.dose", "1000", value_numeric=1000.0, unit_raw="mg", evidence_id="ev-conflict-incompat", extraction_confidence=0.80),
+        _make_claim("c-f", "med.frequency", "daily", evidence_id="ev-conflict-incompat"),
+    ]
+    ev_map = {"ev-conflict-incompat": ev}
+    ver_map = {c.claim_id: _make_verification(c.claim_id, c.evidence_id) for c in claims}
+
+    bundle = claims_to_fhir_bundle(claims, ev_map, ver_map, document_type="clinic_rx_pad")
+    med_requests = [e.resource for e in bundle.entry if isinstance(e.resource, MedicationRequest)]
+    assert len(med_requests) == 0
 
 
 # ─── 4. UNSUPPORTED, INCOMPLETE & SPECIAL DOSING ────────────────────────────

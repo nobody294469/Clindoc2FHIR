@@ -455,9 +455,9 @@ def test_competing_candidates_deterministic_selection_and_audit():
     ev = _make_evidence()
     ev_map = {ev.evidence_id: ev}
 
-    # Two competing value candidates for the same group
+    # Two competing clinically equivalent value candidates for the same group (e.g. 110 vs 110.0)
     c_val_high = _make_claim("c-val-1", "lab.value", "110", value_numeric=110.0, unit_raw="mg/dL", confidence=0.98)
-    c_val_low = _make_claim("c-val-2", "lab.value", "112", value_numeric=112.0, unit_raw="mg/dL", confidence=0.85)
+    c_val_low = _make_claim("c-val-2", "lab.value", "110.0", value_numeric=110.0, unit_raw="mg/dL", confidence=0.85)
     c_name = _make_claim("c-name", "lab.test_name", "Glucose", normalized_code="2345-7", code_system="LOINC")
 
     claims = [c_val_high, c_val_low, c_name]

@@ -803,4 +803,4 @@ def test_full_worker_completion_lifecycle(
             .all()
         )
     ]
-    assert stage_names == ["OCR", "EXTRACTION", "NORMALIZATION", "VERIFICATION"]
+    assert stage_names == ["OCR", "EXTRACTION", "NORMALIZATION", "VERIFICATION", "PERSISTENCE"]
