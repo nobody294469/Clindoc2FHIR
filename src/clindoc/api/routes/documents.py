@@ -42,12 +42,19 @@ from clindoc.api.deps import (
     get_audit_service,
     get_blob_store,
     get_ehr_integration_service,
+    get_ehr_outbox_service,
     get_fhir_export_service,
     get_ingest_service,
     get_job_queue,
 )
-from clindoc.db.enums import DocumentStatus
-from clindoc.db.models import Document, FHIRBundle
+from clindoc.config import (
+    ProductionProfileError,
+    RuntimeProfile,
+    acquire_document_xact_lock,
+    get_active_profile,
+)
+from clindoc.db.enums import DocumentApprovalStatus, DocumentStatus
+from clindoc.db.models import Document, DocumentApproval, FHIRBundle, FHIRExport
 from clindoc.ingest.service import DocumentIngestionService
 from clindoc.jobs.queue import JobQueue
 from clindoc.services.ehr_integration import (
@@ -85,6 +92,7 @@ async def upload_document(
     request: Request,
     file: UploadFile = File(...),
     patient_context_id: Optional[str] = Form(None),
+    supersedes_id: Optional[uuid.UUID] = Form(None),
     current_user: AuthenticatedUser = Depends(require_role(CanonicalRole.DOCUMENT_OPERATOR)),
     session: Session = Depends(get_db_session),
     ingest_service: DocumentIngestionService = Depends(get_ingest_service),
@@ -125,6 +133,22 @@ async def upload_document(
     content_type = file.content_type
 
     try:
+        # Supersession validation: prior document cannot be superseded if it has existing exports
+        if supersedes_id is not None:
+            acquire_document_xact_lock(session, supersedes_id)
+            prior_doc = session.get(Document, supersedes_id)
+            if prior_doc is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Prior document '{supersedes_id}' to supersede not found.",
+                )
+            prior_export = session.query(FHIRExport).filter(FHIRExport.document_id == supersedes_id).first()
+            if prior_export is not None or prior_doc.status == DocumentStatus.EXPORTED:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Cannot supersede document '{supersedes_id}' with existing export records. Manual operational reconciliation required.",
+                )
+
         # 1. Ingestion screening and persistence (commit=False to keep transaction open)
         doc = ingest_service.ingest_document(
             session=session,
@@ -133,6 +157,7 @@ async def upload_document(
             uploaded_by=current_user.user_id,
             declared_mime_type=content_type,
             patient_context_id=patient_context_id.strip() if patient_context_id else None,
+            supersedes_id=supersedes_id,
             commit=False,
         )
 
@@ -437,10 +462,51 @@ async def get_document_fhir_bundle(
     blob_store: BlobStore = Depends(get_blob_store),
 ):
     """Retrieve the finalized, approved FHIR R4B Bundle for a document (Phase 8.8)."""
+    acquire_document_xact_lock(session, document_id)
+
+    doc = session.get(Document, document_id)
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Document with ID '{document_id}' not found.",
+        )
+
+    # 1. Supersession Check
+    superseding_doc = (
+        session.query(Document)
+        .filter(Document.supersedes_id == document_id)
+        .first()
+    )
+    if superseding_doc is not None:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=f"Document '{document_id}' has been superseded by document '{superseding_doc.id}'.",
+        )
+
+    # 2. Unfiltered Approval Selection across all statuses
+    latest_approval = (
+        session.query(DocumentApproval)
+        .filter(DocumentApproval.document_id == document_id)
+        .order_by(DocumentApproval.created_at.desc(), DocumentApproval.id.desc())
+        .first()
+    )
+    if not latest_approval or latest_approval.approval_status != DocumentApprovalStatus.APPROVED:
+        approval_status_str = getattr(latest_approval, "approval_status", "NONE")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Document '{document_id}' does not have an active approved status (latest approval status: {approval_status_str}).",
+        )
+    if not latest_approval.is_export_eligible:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Document '{document_id}' approval record is not export-eligible.",
+        )
+
+    # 3. Retrieve Bundle Record
     bundle_row = (
         session.query(FHIRBundle)
         .filter(FHIRBundle.document_id == document_id)
-        .order_by(FHIRBundle.created_at.desc())
+        .order_by(FHIRBundle.created_at.desc(), FHIRBundle.id.desc())
         .first()
     )
     if not bundle_row:
@@ -462,10 +528,16 @@ async def get_document_fhir_bundle(
                 detail="Failed to retrieve FHIR bundle payload from storage.",
             ) from exc
 
-    # Stage 3.4 Complete Attestation Gateway Check:
-    # If the bundle carries an audit provenance extension or an audit ledger is active,
-    # verify complete attestation before release!
+    # 4. Attestation Gateway Check:
     ledger_path_env = os.getenv("CLINDOC_AUDIT_LEDGER_PATH")
+    is_prod = get_active_profile() == RuntimeProfile.PRODUCTION
+
+    if is_prod and (not ledger_path_env or not os.path.exists(ledger_path_env)):
+        raise HTTPException(
+            status_code=status.HTTP_428_PRECONDITION_REQUIRED,
+            detail="Production profile requires complete audit ledger attestation, but audit ledger path is missing or inaccessible.",
+        )
+
     if ledger_path_env and os.path.exists(ledger_path_env):
         from clindoc.audit.projection import AuditProjectionEngine
         from clindoc.fhir.signing import IncompleteAttestationError, BundleSigningError
@@ -495,52 +567,63 @@ async def get_document_fhir_bundle(
     return bundle_dict
 
 
-@router.post("/{document_id}/transmit-ehr", status_code=status.HTTP_200_OK)
+from pydantic import BaseModel
+
+
+class EHRTransmitRequest(BaseModel):
+    reconciliation_token: Optional[str] = None
+
+
+@router.post("/{document_id}/transmit-ehr", status_code=status.HTTP_202_ACCEPTED)
 async def transmit_document_to_ehr(
     request: Request,
     document_id: uuid.UUID,
     destination_type: str = Query("sandbox", pattern="^(sandbox|mock|staging|production)$"),
+    payload: Optional[EHRTransmitRequest] = None,
     current_user: AuthenticatedUser = Depends(require_export_access),
     session: Session = Depends(get_db_session),
     ehr_service: EHRIntegrationService = Depends(get_ehr_integration_service),
+    outbox_service = Depends(get_ehr_outbox_service),
 ):
-    """Deliver an approved, verified document to the EHR transmission boundary (Phase 8.12).
+    """Deliver an approved, verified document to the EHR transmission boundary (Phase B1 Outbox).
 
-    Enforces:
-      - RBAC: integration_service or approver role required.
-      - Four-Eyes check: Document must be APPROVED and is_export_eligible=True.
-      - Patient identity: Patient identity must be CONFIRMED.
-      - Safety boundary: Fallback or unverified claims are strictly blocked.
-      - Idempotency: Duplicate transmissions are detected and rejected.
-      - Audit trail: Emits hash-chained EHR_TRANSMISSION_* audit events.
+    Stages the transmission intent in ehr_transmission_outbox for asynchronous background dispatch.
     """
     correlation_id = getattr(request.state, "correlation_id", None) or str(uuid.uuid4())
+    recon_token = payload.reconciliation_token if payload else None
+
+    from clindoc.services.outbox_service import OutboxConflictError, OutboxError
     try:
-        result = ehr_service.transmit_document_to_ehr(
-            session=session,
+        staging_res = outbox_service.stage_transmission_intent(
             document_id=document_id,
+            destination_identity=destination_type,
             actor_id=current_user.user_id,
-            destination_type=destination_type,
             correlation_id=correlation_id,
+            reconciliation_token=recon_token,
         )
-        session.commit()
-        return result.to_dict()
+        if staging_res.is_duplicate:
+            return Response(
+                content=json.dumps(staging_res.to_dict()),
+                status_code=status.HTTP_200_OK,
+                media_type="application/json",
+            )
+        return Response(
+            content=json.dumps(staging_res.to_dict()),
+            status_code=status.HTTP_202_ACCEPTED,
+            media_type="application/json",
+            headers={"Location": f"/documents/{document_id}/outbox-status/{staging_res.outbox_id}"},
+        )
+    except OutboxConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except FHIRExportNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (EHRApprovalMissingError, EHRPatientIdentityError, FHIRExportEligibilityError, EHRUnresolvedClaimError) as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
     except EHRDuplicateSubmissionError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except EHRDraftRejectionError as exc:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
-    except EHRTimeoutError as exc:
-        raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=str(exc)) from exc
-    except EHRAuthenticationError as exc:
+    except (EHRTransportError, EHRIntegrationError, FHIRExportError, OutboxError) as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
-    except EHRValidationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
-    except (EHRTransportError, EHRIntegrationError, FHIRExportError) as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
 
 
 

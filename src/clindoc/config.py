@@ -271,3 +271,170 @@ def get_backoff_max_delay() -> float:
     return DEFAULT_BACKOFF_MAX_DELAY
 
 
+# ─── DATABASE ADVISORY LOCKING & PRODUCTION GUARDS ───────────────────────────
+
+CLINDOC_DOC_LOCK_NAMESPACE: int = 1129071692  # 0x434C4443 = 'CLDC'
+
+
+def acquire_document_xact_lock(session: Any, document_id: Union[Any, str]) -> None:
+    """Acquire transaction-scoped advisory lock for the document in PostgreSQL.
+
+    Uses namespace 1129071692 (0x434C4443 = 'CLDC') and hashtext(document_id::text).
+    In non-PostgreSQL dialects (e.g. SQLite test runners), this is a safe no-op.
+    """
+    bind = session.get_bind() if hasattr(session, "get_bind") else getattr(session, "bind", None)
+    if bind is not None and getattr(bind, "dialect", None) is not None and bind.dialect.name == "postgresql":
+        from sqlalchemy import text
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:ns, hashtext(:doc_id))"),
+            {"ns": CLINDOC_DOC_LOCK_NAMESPACE, "doc_id": str(document_id)},
+        )
+
+
+def validate_production_configuration() -> None:
+    """Validate strict production runtime environment and configuration invariants.
+
+    Enforces:
+      1. Runtime profile is strictly PRODUCTION.
+      2. CLINDOC_ENV == 'production'.
+      3. Four-eyes enforcement active (CLINDOC_ENFORCE_FOUR_EYES == 'true').
+      4. Audit ledger enforcement active (CLINDOC_ENFORCE_AUDIT == 'true').
+      5. Valid, non-placeholder HMAC signing key >= 32 UTF-8 bytes with resolved active key ID.
+      6. ModernBERT checkpoint, calibration temperature, and vLLM endpoint configuration.
+    """
+    profile = get_active_profile()
+    if profile != RuntimeProfile.PRODUCTION:
+        raise ProductionProfileError(
+            f"Production configuration violation: Active profile '{profile.value}' is not 'production'."
+        )
+
+    env_val = os.getenv("CLINDOC_ENV", "").strip().lower()
+    if env_val != "production":
+        raise ProductionProfileError(
+            f"Production configuration violation: CLINDOC_ENV must be 'production', got '{os.getenv('CLINDOC_ENV')}'."
+        )
+
+    four_eyes = os.getenv("CLINDOC_ENFORCE_FOUR_EYES", "").strip().lower()
+    if four_eyes != "true":
+        raise ProductionProfileError(
+            "Production configuration violation: CLINDOC_ENFORCE_FOUR_EYES must be 'true' in production."
+        )
+
+    enforce_audit = os.getenv("CLINDOC_ENFORCE_AUDIT", "").strip().lower()
+    if enforce_audit != "true":
+        raise ProductionProfileError(
+            "Production configuration violation: CLINDOC_ENFORCE_AUDIT must be 'true' in production."
+        )
+
+    # Validate HMAC key
+    key_id = os.getenv("CLINDOC_AUDIT_HMAC_KEY_ID", "default").strip()
+    if key_id.lower() == "default":
+        raw_key = os.getenv("CLINDOC_AUDIT_HMAC_KEY_DEFAULT") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+    else:
+        raw_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{key_id.upper()}")
+
+    if not raw_key or not raw_key.strip():
+        raise ProductionProfileError(
+            f"Production configuration violation: HMAC key for key_id '{key_id}' is missing, empty, or whitespace-only."
+        )
+
+    lower_trimmed = raw_key.strip().lower()
+    placeholders = {
+        "empty", "default", "test", "dev", "development", "staging", "prod",
+        "production", "password", "changeme", "secret", "insecure", "placeholder",
+        "12345678", "admin",
+    }
+    if lower_trimmed in placeholders:
+        raise ProductionProfileError(
+            f"Production configuration violation: HMAC key for key_id '{key_id}' uses a known placeholder value."
+        )
+
+    # Preserve exact raw_key bytes without stripping or normalization
+    key_bytes = raw_key.encode("utf-8")
+    if len(key_bytes) < 32:
+        raise ProductionProfileError(
+            f"Production configuration violation: HMAC key for key_id '{key_id}' must be at least 32 UTF-8 bytes (got {len(key_bytes)} bytes)."
+        )
+
+    # Reject obvious repeated multi-character patterns (e.g. 'abcd' * 8, '1234' * 8)
+    n = len(raw_key)
+    for chunk_len in range(1, (n // 2) + 1):
+        if n % chunk_len == 0 and raw_key == raw_key[:chunk_len] * (n // chunk_len):
+            raise ProductionProfileError(
+                f"Production configuration violation: HMAC key for key_id '{key_id}' uses an insecure repeating pattern."
+            )
+
+    # Reject predictable cyclic/sequential alphanumeric sequences
+    cyclic_sequences = [
+        "0123456789" * 5,
+        "9876543210" * 5,
+        "abcdefghijklmnopqrstuvwxyz" * 3,
+        "zyxwvutsrqponmlkjihgfedcba" * 3,
+        "0123456789abcdefghijklmnopqrstuvwxyz" * 2,
+        "abcdefghijklmnopqrstuvwxyz0123456789" * 2,
+    ]
+    for seq in cyclic_sequences:
+        if raw_key.lower() in seq:
+            raise ProductionProfileError(
+                f"Production configuration violation: HMAC key for key_id '{key_id}' uses a predictable sequential value."
+            )
+
+    # Reject ascending or descending ASCII sequences of 8 or more consecutive characters
+    run_len = 1
+    for i in range(len(raw_key) - 1):
+        diff = ord(raw_key[i + 1]) - ord(raw_key[i])
+        if diff in (1, -1):
+            run_len += 1
+            if run_len >= 8:
+                raise ProductionProfileError(
+                    f"Production configuration violation: HMAC key for key_id '{key_id}' uses a predictable sequential value."
+                )
+        else:
+            run_len = 1
+
+    ProductionPipelineConfig(profile=RuntimeProfile.PRODUCTION).validate()
+
+
+def validate_daemon_profile(daemon_name: str) -> RuntimeProfile:
+    """Validate daemon startup against explicit profile requirement.
+
+    Daemons (API server, Background worker) must NOT start without an explicit CLINDOC_PROFILE.
+    """
+    raw_profile = os.environ.get("CLINDOC_PROFILE")
+    if raw_profile is None or not raw_profile.strip():
+        raise ProductionProfileError(
+            f"{daemon_name} startup failed: CLINDOC_PROFILE environment variable is strictly required ('dev' or 'production')."
+        )
+
+    profile = RuntimeProfile.from_string(raw_profile)
+    if profile == RuntimeProfile.PRODUCTION:
+        validate_production_configuration()
+    return profile
+
+
+# ─── PATIENT IDENTIFIER SYSTEM CONFIGURATION (Phase A) ────────────────────────
+
+CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM: str = os.environ.get(
+    "CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM",
+    "http://hospital.example.org/identifiers/mrn",
+)
+
+
+def get_allowed_patient_identifier_systems() -> list[str]:
+    """Return the set of accepted patient identifier authority URIs.
+
+    Primary identifier system is always guaranteed to be present at index 0.
+    """
+    primary = os.environ.get(
+        "CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM",
+        "http://hospital.example.org/identifiers/mrn",
+    ).strip()
+    raw = os.environ.get("CLINDOC_ALLOWED_PATIENT_IDENTIFIER_SYSTEMS", "")
+    systems = [s.strip() for s in raw.split(",") if s.strip()]
+    if primary and primary not in systems:
+        systems.insert(0, primary)
+    return systems
+
+
+
+

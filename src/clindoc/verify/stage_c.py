@@ -196,7 +196,9 @@ class VLLMJudgeClient:
                 },
             },
         }
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {}
+        if self.api_key and self.api_key.strip() and self.api_key.strip() != "EMPTY":
+            headers["Authorization"] = f"Bearer {self.api_key.strip()}"
 
         with self.concurrency_limiter:
             with self.circuit_breaker:

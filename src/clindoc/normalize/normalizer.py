@@ -5,6 +5,7 @@ Authority:
   - DEC-002: code_confidence thresholding (target >=95% precision on accepted codes; provisional default 0.75)
   - DEC-007: hybrid lexical + semantic retrieval for LOINC/RxNorm; deterministic UCUM lookup
   - PHASE0_ARCHITECTURE_RESOLUTION AUDIT-14
+  - Phase 3D.2: TerminologyNormalizer Adapter Integration with TerminologyRetrievalService
 
 MUST Rules:
   - NEVER alter raw claim value (§14.3, auditability requirement).
@@ -14,13 +15,21 @@ MUST Rules:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import re
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from clindoc.extract.contracts import Claim, CodeSystem
 from clindoc.normalize.hybrid import CandidateMatch, HybridTerminologyRetriever, SemanticEmbedder
 from clindoc.normalize.ucum import UCUMNormalizer
+from clindoc.terminology.service import (
+    ContextStatus,
+    QueryContext,
+    TerminologyRetrievalService,
+)
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_LOINC_PATH = Path("configs/loinc_subset.json")
 DEFAULT_MED_PATH = Path("configs/medication_subset.json")
@@ -96,8 +105,8 @@ class TerminologyNormalizer:
     """Production Terminology Normalization subsystem.
 
     Maps:
-      - lab.test_name -> LOINC
-      - med.name      -> RxNorm
+      - lab.test_name -> LOINC / CLCI
+      - med.name      -> CDCI / RxNorm
       - lab.unit / unit_raw -> UCUM
       - lab.value / med.dose numeric parsing & UCUM unit normalization (§8.3)
     """
@@ -111,15 +120,17 @@ class TerminologyNormalizer:
         rxnorm_threshold: float = 0.75,  # DEC-002 provisional default
         hybrid_alpha: float = 0.5,       # DEC-007 lexical vs semantic balance
         semantic_embedder: Optional[SemanticEmbedder] = None,
+        retrieval_service: Optional[TerminologyRetrievalService] = None,
     ) -> None:
         self.loinc_threshold = float(loinc_threshold)
         self.rxnorm_threshold = float(rxnorm_threshold)
+        self.retrieval_service = retrieval_service
 
         # 1. Initialize UCUM Deterministic Normalizer
         resolved_ucum = _resolve_config_path(ucum_path or DEFAULT_UCUM_PATH)
         self.ucum_normalizer = UCUMNormalizer(resolved_ucum)
 
-        # 2. Initialize LOINC Hybrid Retriever
+        # 2. Initialize LOINC Hybrid Retriever (legacy fallback)
         self.loinc_retriever = HybridTerminologyRetriever(
             system_name="LOINC", alpha=hybrid_alpha, semantic_embedder=semantic_embedder
         )
@@ -128,7 +139,7 @@ class TerminologyNormalizer:
             with open(resolved_loinc, "r", encoding="utf-8") as f:
                 self.loinc_retriever.index_concepts(json.load(f))
 
-        # 3. Initialize RxNorm Hybrid Retriever
+        # 3. Initialize RxNorm Hybrid Retriever (legacy fallback)
         self.rxnorm_retriever = HybridTerminologyRetriever(
             system_name="RxNorm", alpha=hybrid_alpha, semantic_embedder=semantic_embedder
         )
@@ -139,17 +150,27 @@ class TerminologyNormalizer:
 
         # Audit candidates store: keyed by claim_id -> list of candidate dicts
         self.audit_candidates: dict[str, list[dict[str, Any]]] = {}
+        # Audit abstention reasons: keyed by claim_id -> list of reason strings
+        self.audit_reasons: dict[str, list[str]] = {}
         # Normalized units store: keyed by claim_id -> canonical UCUM unit string
         self.normalized_units: dict[str, str] = {}
 
-    def clear_audit_candidates(self) -> None:
-        """Clear stored audit candidates and normalized units cache to prevent memory leaks."""
+    def clear_audit_state(self) -> None:
+        """Clear all stored transient per-claim state (candidates, reasons, units) to prevent memory leaks."""
         self.audit_candidates.clear()
+        self.audit_reasons.clear()
         self.normalized_units.clear()
+
+    # Backwards-compatible alias for existing callers
+    clear_audit_candidates = clear_audit_state
 
     def get_audit_candidates(self, claim_id: str) -> list[dict[str, Any]]:
         """Retrieve stored normalization candidates for a given claim_id (§7.5)."""
         return list(self.audit_candidates.get(claim_id, []))
+
+    def get_audit_reasons(self, claim_id: str) -> list[str]:
+        """Retrieve stored abstention reasons for a given claim_id."""
+        return list(self.audit_reasons.get(claim_id, []))
 
     def get_normalized_unit(self, claim_id: str) -> Optional[str]:
         """Retrieve the canonical UCUM unit for a claim_id (§8.3)."""
@@ -159,6 +180,27 @@ class TerminologyNormalizer:
         """Retrieve candidates for a given clinical field type and query string (§7.5)."""
         if not query or not query.strip():
             return []
+
+        if self.retrieval_service is not None and field_type in ("lab.test_name", "med.name"):
+            domain = "LAB" if field_type == "lab.test_name" else "MEDICATION"
+            try:
+                resp = self.retrieval_service.retrieve(query, context=QueryContext(domain=domain), max_candidates=top_k)
+                return [
+                    {
+                        "code": c.code,
+                        "display": c.canonical_name,
+                        "matched_alias": c.matched_alias,
+                        "score": round(c.rank_score, 4),
+                        "system": c.system,
+                        "tty": c.tty,
+                        "context_status": c.context_status.value if hasattr(c.context_status, "value") else str(c.context_status),
+                        "retrieval_method": c.retrieval_method.value if hasattr(c.retrieval_method, "value") else str(c.retrieval_method),
+                    }
+                    for c in resp.candidates
+                ]
+            except Exception as e:
+                logger.warning(f"Terminology retrieval query failed for {field_type} '{query}': {e}")
+                return []
 
         if field_type == "lab.test_name":
             matches = self.loinc_retriever.retrieve(query, top_k=top_k)
@@ -173,7 +215,7 @@ class TerminologyNormalizer:
             return []
         return []
 
-    def normalize_claim(self, claim: Claim) -> Claim:
+    def normalize_claim(self, claim: Claim, context: Optional[QueryContext] = None) -> Claim:
         """Enrich a single Claim with standardized terminology code, unit, and confidence.
 
         MUST NOT alter claim.value or claim.unit_raw (§14.3).
@@ -184,12 +226,84 @@ class TerminologyNormalizer:
         original_value = claim.value
         original_unit = claim.unit_raw
 
-        candidates: list[CandidateMatch] = []
+        candidates: list[Any] = []
         best_code: Optional[str] = None
         best_system: CodeSystem = None
         best_conf: float = 0.0
 
-        if claim.field_type == "lab.test_name":
+        if claim.field_type in ("lab.test_name", "med.name") and self.retrieval_service is not None:
+            domain = "LAB" if claim.field_type == "lab.test_name" else "MEDICATION"
+            threshold = self.loinc_threshold if claim.field_type == "lab.test_name" else self.rxnorm_threshold
+
+            ctx_obj = context if context is not None else QueryContext(domain=domain)
+
+            try:
+                resp = self.retrieval_service.retrieve(claim.value, context=ctx_obj, max_candidates=10)
+            except Exception as e:
+                logger.error(f"TerminologyRetrievalService failed for claim {claim.claim_id}: {e}")
+                self.audit_reasons.setdefault(claim.claim_id, []).append(
+                    f"Terminology retrieval service failure: {str(e)}"
+                )
+                self.audit_candidates[claim.claim_id] = []
+                resp = None
+
+            if resp is not None:
+                if resp.abstention_reasons:
+                    self.audit_reasons[claim.claim_id] = list(resp.abstention_reasons)
+
+                audit_list = [
+                    {
+                        "code": c.code,
+                        "display": c.canonical_name,
+                        "matched_alias": c.matched_alias,
+                        "score": round(c.rank_score, 4),
+                        "system": c.system,
+                        "tty": c.tty,
+                        "context_status": c.context_status.value if hasattr(c.context_status, "value") else str(c.context_status),
+                        "retrieval_method": c.retrieval_method.value if hasattr(c.retrieval_method, "value") else str(c.retrieval_method),
+                    }
+                    for c in resp.candidates
+                ]
+                self.audit_candidates[claim.claim_id] = audit_list
+
+                # Selection logic:
+                # 1. If explicit service abstention or no candidates: fail closed
+                if not resp.is_abstained and resp.candidates:
+                    valid_candidates = [
+                        c for c in resp.candidates
+                        if c.context_status in (ContextStatus.PASSED, ContextStatus.NO_RULES)
+                    ]
+                    if valid_candidates:
+                        top = valid_candidates[0]
+                        top_score = top.rank_score
+
+                        # 2. Check threshold
+                        if top_score >= threshold:
+                            # 3. For laboratory claims, check for ambiguous ties among distinct concepts in the same coding system
+                            if claim.field_type == "lab.test_name":
+                                top_tier_concepts = {
+                                    c.concept_id for c in valid_candidates
+                                    if abs(c.rank_score - top_score) < 1e-6 and c.system == top.system
+                                }
+                                if len(top_tier_concepts) > 1:
+                                    # Ambiguous laboratory mention: abstain
+                                    best_code = None
+                                    best_system = None
+                                    best_conf = 0.0
+                                    self.audit_reasons.setdefault(claim.claim_id, []).append(
+                                        f"Ambiguous laboratory mention: {len(top_tier_concepts)} distinct concepts tied at rank {top_score}"
+                                    )
+                                else:
+                                    best_code = top.code
+                                    best_system = top.system  # "LOINC", "RxNorm", or "CDCI"
+                                    best_conf = round(top_score, 4)
+                            else:
+                                # Medication claim
+                                best_code = top.code
+                                best_system = top.system  # "CDCI" or "RxNorm"
+                                best_conf = round(top_score, 4)
+
+        elif claim.field_type == "lab.test_name":
             threshold = self.loinc_threshold
             matches = self.loinc_retriever.retrieve(claim.value, top_k=5)
             candidates = matches
@@ -199,6 +313,7 @@ class TerminologyNormalizer:
                 if best_conf >= threshold:
                     best_code = top.code
                     best_system = "LOINC"
+            self.audit_candidates[claim.claim_id] = [c.to_dict() for c in candidates]
 
         elif claim.field_type == "med.name":
             threshold = self.rxnorm_threshold
@@ -210,6 +325,7 @@ class TerminologyNormalizer:
                 if best_conf >= threshold:
                     best_code = top.code
                     best_system = "RxNorm"
+            self.audit_candidates[claim.claim_id] = [c.to_dict() for c in candidates]
 
         elif claim.field_type == "lab.unit":
             canon, conf = self.ucum_normalizer.normalize(claim.value)
@@ -227,6 +343,7 @@ class TerminologyNormalizer:
                     best_conf = round(conf_u, 4)
                     self.normalized_units[claim.claim_id] = canon_u
                     candidates = [CandidateMatch(code=canon_u, display=canon_u, score=conf_u, system="UCUM")]
+            self.audit_candidates[claim.claim_id] = [c.to_dict() for c in candidates]
 
         # Handle numeric claims (lab.value, med.dose) and qualitative determinations (PD-022)
         elif claim.field_type in ("lab.value", "med.dose"):
@@ -268,8 +385,7 @@ class TerminologyNormalizer:
                         best_conf = round(ucum_conf, 4)
                         candidates = [CandidateMatch(code=canon_unit, display=canon_unit, score=ucum_conf, system="UCUM")]
 
-        # Record candidates for machine-readable audit report (§7.5)
-        self.audit_candidates[claim.claim_id] = [c.to_dict() for c in candidates]
+            self.audit_candidates[claim.claim_id] = [c.to_dict() for c in candidates]
 
         # Invariant checks: claim.value and claim.unit_raw MUST remain completely untouched (§14.3)
         assert claim.value == original_value, "Invariant violation: claim.value was modified (§14.3)"
@@ -282,8 +398,13 @@ class TerminologyNormalizer:
 
         return claim
 
-    def normalize_claims(self, claims: list[Claim]) -> list[Claim]:
+    def normalize_claims(
+        self,
+        claims: list[Claim],
+        contexts: Optional[dict[str, QueryContext]] = None,
+    ) -> list[Claim]:
         """Normalize a list of claims in place and return them."""
         for c in claims:
-            self.normalize_claim(c)
+            ctx = contexts.get(c.claim_id) if contexts else None
+            self.normalize_claim(c, context=ctx)
         return claims

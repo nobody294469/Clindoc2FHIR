@@ -365,6 +365,13 @@ def get_document_claims(
         review_state_str = c.review_state.value if hasattr(c.review_state, "value") else str(c.review_state)
         origin_str = c.origin.value if hasattr(c.origin, "value") else str(c.origin)
 
+        # Read audit data safely from persisted ORM payload
+        payload = c.payload or {}
+        raw_candidates = payload.get("candidates")
+        candidates = list(raw_candidates) if isinstance(raw_candidates, list) else []
+        raw_reasons = payload.get("abstention_reasons")
+        abstention_reasons = list(raw_reasons) if isinstance(raw_reasons, list) else []
+
         claims_output.append({
             "id": str(c.id),
             "claim_id": str(c.claim_id),
@@ -374,6 +381,8 @@ def get_document_claims(
             "value": c.value,
             "normalized_code": c.normalized_code,
             "code_system": c.code_system,
+            "candidates": candidates,
+            "abstention_reasons": abstention_reasons,
             "version": c.version,
             "supersedes_claim_id": str(c.supersedes_claim_id) if c.supersedes_claim_id else None,
             "origin": origin_str,

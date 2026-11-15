@@ -204,3 +204,57 @@ def set_global_ehr_integration_service(service) -> None:
     _GLOBAL_EHR_INTEGRATION_SERVICE = service
 
 
+_GLOBAL_EHR_OUTBOX_SERVICE = None
+
+
+def get_ehr_outbox_service(
+    ehr_service = Depends(get_ehr_integration_service),
+):
+    """FastAPI dependency: Resolve EHROutboxService."""
+    global _GLOBAL_EHR_OUTBOX_SERVICE
+    if _GLOBAL_EHR_OUTBOX_SERVICE is not None:
+        return _GLOBAL_EHR_OUTBOX_SERVICE
+    from clindoc.services.outbox_service import EHROutboxService
+    session_factory = getattr(ehr_service, "session_factory", None)
+    if session_factory is None:
+        from clindoc.db.base import SessionLocal
+        session_factory = SessionLocal
+    return EHROutboxService(session_factory=session_factory, ehr_integration_service=ehr_service)
+
+
+def set_global_ehr_outbox_service(service) -> None:
+    """Override application-wide EHROutboxService (for testing/lifecycle)."""
+    global _GLOBAL_EHR_OUTBOX_SERVICE
+    _GLOBAL_EHR_OUTBOX_SERVICE = service
+
+
+# ─── Terminology Retrieval Service Dependency (Phase 3D.3) ───────────────────
+
+_GLOBAL_TERMINOLOGY_SERVICE = None
+
+
+def set_global_terminology_service(service, force: bool = False) -> None:
+    """Set the application-wide TerminologyRetrievalService instance (for testing/lifecycle).
+    
+    Safety Rules:
+      - Defaults to force=False to prevent silently closing or replacing an active service in use.
+      - If force=True is passed, caller must guarantee prior quiescence.
+    """
+    global _GLOBAL_TERMINOLOGY_SERVICE
+    from clindoc.terminology.service import set_process_terminology_service
+    set_process_terminology_service(service, force=force)
+    _GLOBAL_TERMINOLOGY_SERVICE = service
+
+
+def get_terminology_service():
+    """FastAPI dependency: Resolve the active TerminologyRetrievalService."""
+    global _GLOBAL_TERMINOLOGY_SERVICE
+    if _GLOBAL_TERMINOLOGY_SERVICE is not None:
+        return _GLOBAL_TERMINOLOGY_SERVICE
+    from clindoc.terminology.service import get_process_terminology_service
+    _GLOBAL_TERMINOLOGY_SERVICE = get_process_terminology_service()
+    return _GLOBAL_TERMINOLOGY_SERVICE
+
+
+
+

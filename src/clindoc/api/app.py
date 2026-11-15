@@ -34,6 +34,7 @@ from clindoc.api.routes import (
     metrics_router,
     review_router,
 )
+from clindoc.config import validate_daemon_profile
 from clindoc.observability.middleware import PrometheusMetricsMiddleware
 
 logger = logging.getLogger("clindoc.api")
@@ -52,6 +53,7 @@ def create_app(
     cors_origins: Optional[list[str]] = None,
 ) -> FastAPI:
     """Create and configure a production-ready FastAPI application instance."""
+    validate_daemon_profile("API Server")
     app = FastAPI(
         title=title,
         version=version,

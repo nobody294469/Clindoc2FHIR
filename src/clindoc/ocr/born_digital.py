@@ -30,11 +30,24 @@ def extract_born_digital_pdf(pdf_path: str | Path, doc_id: str | None = None) ->
 
         # Group words by (block_no, line_no)
         lines_dict: dict[tuple[int, int], list[WordBox]] = defaultdict(list)
+        rot_mat = page.rotation_matrix if getattr(page, "rotation", 0) != 0 else None
+        origin_x = float(page.rect.x0)
+        origin_y = float(page.rect.y0)
 
         for w in raw_words:
             x0, y0, x1, y1, word_text, b_no, l_no, _ = w
             if not word_text.strip():
                 continue
+
+            if rot_mat:
+                r = pymupdf.Rect(x0, y0, x1, y1) * rot_mat
+                x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
+
+            x0 -= origin_x
+            y0 -= origin_y
+            x1 -= origin_x
+            y1 -= origin_y
+
             word_box = WordBox(
                 text=word_text.strip(),
                 bbox=[round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],

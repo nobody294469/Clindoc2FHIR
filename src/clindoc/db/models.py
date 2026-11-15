@@ -18,6 +18,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -25,7 +26,36 @@ from sqlalchemy import (
     UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.sql.expression import TextClause
+
+
+class Hex64Check(TextClause):
+    """Dialect-aware check expression for 64-character lowercase hexadecimal fields."""
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__(f"length({column_name}) = 64")
+        self.column_name = column_name
+
+
+@compiles(Hex64Check, "postgresql")
+def _compile_hex64_pg(element: Hex64Check, compiler: Any, **kw: Any) -> str:
+    col = element.column_name
+    return f"(length({col}) = 64 AND {col} ~ '^[0-9a-f]{{64}}$')"
+
+
+@compiles(Hex64Check, "sqlite")
+def _compile_hex64_sqlite(element: Hex64Check, compiler: Any, **kw: Any) -> str:
+    col = element.column_name
+    return f"(length({col}) = 64 AND {col} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(Hex64Check)
+def _compile_hex64_default(element: Hex64Check, compiler: Any, **kw: Any) -> str:
+    col = element.column_name
+    return f"(length({col}) = 64 AND lower({col}) = {col})"
+
 
 from clindoc.db.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 from clindoc.db.enums import (
@@ -34,11 +64,15 @@ from clindoc.db.enums import (
     ContradictionType,
     DocumentApprovalStatus,
     DocumentStatus,
+    EHRResolutionStatus,
+    EHRTransmissionState,
     FHIRExportStatus,
     FHIRVersion,
     IdentityVerificationStatus,
     JobStatus,
+    OutboxStatus,
     PatientIdentityApprovalStatus,
+    ReconciliationDecision,
     RetentionState,
     ReviewActionType,
     VerificationLabel,
@@ -765,11 +799,40 @@ class FHIRBundle(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 
 class FHIRExport(Base, UUIDPrimaryKeyMixin):
-    """Idempotent record of FHIR bundle export or transmission."""
+    """Idempotent record of FHIR bundle export or transmission (Phase A)."""
 
     __tablename__ = "fhir_exports"
     __table_args__ = (
         Index("ix_fhir_exports_bundle_id", "bundle_id"),
+        Index("ix_fhir_exports_logical_id", "logical_export_id"),
+        Index("ix_fhir_exports_dest_idem_key", "destination_idempotency_key"),
+        UniqueConstraint("logical_export_id", "attempt_number", name="uq_fhir_exports_logical_attempt"),
+        CheckConstraint(
+            """(
+                (target_type = 'FILE_DOWNLOAD' AND 
+                 export_status IN ('PENDING', 'GENERATED', 'FAILED') AND 
+                 transmission_state IS NULL AND 
+                 resolution_status IS NULL AND 
+                 destination_identity IS NULL)
+                OR
+                (target_type = 'EHR_TRANSMISSION' AND destination_identity IS NOT NULL AND (
+                    (export_status = 'PENDING_TRANSPORT' AND transmission_state = 'PENDING_TRANSPORT' AND resolution_status = 'UNRESOLVED') OR
+                    (export_status = 'TRANSMITTED' AND transmission_state = 'TRANSMITTED' AND resolution_status = 'RESOLVED_DELIVERED') OR
+                    (export_status = 'FAILED' AND transmission_state = 'CONFIRMED_FAILED' AND resolution_status = 'RESOLVED_NON_DELIVERY') OR
+                    (export_status = 'FAILED' AND transmission_state IN ('UNKNOWN_RECONCILIATION_REQUIRED', 'HISTORICAL_INDETERMINATE') AND resolution_status = 'UNRESOLVED')
+                ))
+            )""",
+            name="chk_fhir_exports_lifecycle",
+        ),
+        CheckConstraint(
+            "((attempt_number = 1 AND parent_attempt_id IS NULL) OR (attempt_number > 1 AND parent_attempt_id IS NOT NULL))",
+            name="chk_fhir_exports_attempt_lineage",
+        ),
+        CheckConstraint(
+            "(outbox_id IS NULL OR logical_export_id IS NOT NULL)",
+            name="chk_fhir_exports_outbox_logical_both_or_neither",
+        ),
+        UniqueConstraint("id", "outbox_id", name="uq_fhir_exports_id_outbox_id"),
     )
 
     bundle_id: Mapped[uuid.UUID] = mapped_column(
@@ -777,8 +840,24 @@ class FHIRExport(Base, UUIDPrimaryKeyMixin):
         ForeignKey("fhir_bundles.id", ondelete="CASCADE"),
         nullable=False,
     )
-    target_type: Mapped[str] = mapped_column(String(50), default="FILE_DOWNLOAD", nullable=False)
+    target_type: Mapped[str] = mapped_column(
+        String(32), 
+        default="EHR_TRANSMISSION", 
+        server_default="EHR_TRANSMISSION", 
+        nullable=False
+    )
     export_status: Mapped[FHIRExportStatus] = mapped_column(String(32), nullable=False)
+    transmission_state: Mapped[Optional[EHRTransmissionState]] = mapped_column(String(32), nullable=True)
+    resolution_status: Mapped[Optional[EHRResolutionStatus]] = mapped_column(String(32), nullable=True)
+    destination_identity: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    destination_idempotency_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    logical_export_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    attempt_number: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    parent_attempt_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), 
+        ForeignKey("fhir_exports.id", ondelete="RESTRICT"), 
+        nullable=True
+    )
     idempotency_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
     destination_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -793,9 +872,198 @@ class FHIRExport(Base, UUIDPrimaryKeyMixin):
         nullable=False,
     )
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    outbox_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ehr_transmission_outbox.id", ondelete="RESTRICT", use_alter=True),
+        nullable=True,
+        index=True,
+    )
 
     bundle: Mapped[FHIRBundle] = relationship("FHIRBundle", back_populates="exports")
     exporter: Mapped[User] = relationship("User", foreign_keys=[exported_by])
+
+
+class EHRTransmissionReconciliation(Base, UUIDPrimaryKeyMixin):
+    """Clinical authorization for retrying an ambiguous or unresolved EHR transmission (Phase A)."""
+
+    __tablename__ = "ehr_transmission_reconciliations"
+    __table_args__ = (
+        CheckConstraint(
+            "primary_authorizer_id != supervisor_authorizer_id",
+            name="chk_reconciliation_distinct_actors",
+        ),
+    )
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    bundle_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fhir_bundles.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    prior_export_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fhir_exports.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    destination_identity: Mapped[str] = mapped_column(String(512), nullable=False)
+    bundle_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    destination_idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+    decision: Mapped[ReconciliationDecision] = mapped_column(String(64), nullable=False)
+    justification: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_reference: Mapped[str] = mapped_column(String(256), nullable=False)
+    verification_level: Mapped[str] = mapped_column(String(32), nullable=False, default="CLINICAL_CHIEF_REVIEW")
+
+    # Four-Eyes Dual Authorization
+    primary_authorizer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    primary_authorizer_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    supervisor_authorizer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    supervisor_authorizer_role: Mapped[str] = mapped_column(String(64), nullable=False)
+    authorized_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # Single-use consumption & Revocation
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consumed_by_export_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fhir_exports.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+
+class FHIRExportMigrationAudit(Base):
+    """Audit ledger capturing historical FHIRExport records normalized during migration (Phase A)."""
+
+    __tablename__ = "fhir_export_migration_audit"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    export_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    old_target_type: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    new_target_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    old_export_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    new_export_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    old_transmission_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    new_transmission_state: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    old_resolution_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    new_resolution_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    has_conflicting_evidence: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    migration_reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    migrated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+
+class EHRTransmissionOutbox(Base, UUIDPrimaryKeyMixin, TimestampMixin):
+    """Durable staging and dispatch tracking for EHR transmissions (Phase B1)."""
+
+    __tablename__ = "ehr_transmission_outbox"
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id",
+            "destination_identity",
+            "bundle_sha256",
+            name="uq_ehr_transmission_outbox_intent",
+        ),
+        UniqueConstraint(
+            "logical_export_id",
+            name="uq_ehr_transmission_outbox_logical_export",
+        ),
+        UniqueConstraint(
+            "id",
+            "logical_export_id",
+            name="uq_ehr_outbox_id_logical_export",
+        ),
+        ForeignKeyConstraint(
+            ["current_attempt_id", "id"],
+            ["fhir_exports.id", "fhir_exports.outbox_id"],
+            name="fk_ehr_outbox_current_attempt_composite",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+        Index("ix_ehr_outbox_claim_dispatch", "status", "created_at"),
+        Index("ix_ehr_outbox_doc_dest", "document_id", "destination_identity"),
+        Index("ix_ehr_outbox_lease_expires", "lease_expires_at"),
+        CheckConstraint(
+            "status IN ('PENDING', 'DISPATCHING', 'DELIVERED', 'BLOCKED_RECONCILIATION', 'FAILED_TERMINAL')",
+            name="chk_ehr_outbox_status_valid",
+        ),
+        CheckConstraint("worker_recovery_count >= 0", name="chk_ehr_outbox_recovery_count_nonnegative"),
+        CheckConstraint("lease_generation >= 0", name="chk_ehr_outbox_lease_generation_nonnegative"),
+        CheckConstraint(
+            Hex64Check("bundle_sha256"),
+            name="chk_ehr_outbox_bundle_sha256_hex",
+        ),
+        CheckConstraint(
+            Hex64Check("destination_idempotency_key"),
+            name="chk_ehr_outbox_dest_idem_key_hex",
+        ),
+    )
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    bundle_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fhir_bundles.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    bundle_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    destination_identity: Mapped[str] = mapped_column(String(512), nullable=False)
+    logical_export_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    destination_idempotency_key: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    status: Mapped[OutboxStatus] = mapped_column(
+        String(32),
+        default=OutboxStatus.PENDING,
+        server_default="PENDING",
+        nullable=False,
+    )
+    worker_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    worker_recovery_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    current_attempt_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+    )
+
+    staged_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    correlation_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class AuditEvent(Base, UUIDPrimaryKeyMixin):

@@ -354,13 +354,17 @@ class VLLMProvider:
             },
         }
 
+        req_headers = {}
+        if self.api_key and self.api_key.strip() and self.api_key.strip() != "EMPTY":
+            req_headers["Authorization"] = f"Bearer {self.api_key.strip()}"
+
         with self.concurrency_limiter:
             with self.circuit_breaker:
                 if self.http_client is not None:
                     resp = self.http_client.post(
                         f"{self.base_url}/chat/completions",
                         json=payload,
-                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        headers=req_headers,
                     )
                     resp.raise_for_status()
                     data = resp.json()
@@ -370,12 +374,58 @@ class VLLMProvider:
                     resp = client.post(
                         f"{self.base_url}/chat/completions",
                         json=payload,
-                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        headers=req_headers,
                     )
                     resp.raise_for_status()
                     data = resp.json()
 
                 return data["choices"][0]["message"]["content"]
+
+
+_NON_MEDICATION_TOKENS: frozenset[str] = frozenset({
+    "synthetic", "patient", "encounter", "consultation", "history", "chief", "complaint",
+    "illness", "presenting", "routine", "assessment", "plan", "congestive", "heart", "failure",
+    "atrial", "fibrillation", "compensate", "compensated", "controlled", "medications", "medication",
+    "continue", "discontinue", "start", "stop", "laboratory", "results", "recent", "serum", "chemistry",
+    "reveals", "therapeutic", "measured", "denies", "reports", "mild", "exertional", "dyspnea",
+    "climbing", "stairs", "chest", "pain", "palpitations", "orthopnea", "discharge", "summary",
+    "admission", "hospital", "clinic", "department", "physician", "doctor", "nurse", "order",
+    "orders", "findings", "impression", "diagnosis", "diagnoses", "procedure", "procedures",
+    "normal", "high", "low", "critical", "positive", "negative", "reactive", "detected",
+    "potassium", "sodium", "chloride", "glucose", "creatinine", "bnp", "troponin", "hemoglobin",
+    "cardiology", "outpatient", "follow-up", "follow", "up", "level", "levels", "tab", "cap", "syp",
+    "male", "female", "years", "year-old", "year", "old", "clinical", "note", "prevention", "stroke",
+})
+
+_KNOWN_MEDICATIONS: tuple[str, ...] = (
+    "Amoxicillin-clavulanate",
+    "Amoxicillin/clavulanate",
+    "Amoxicillin",
+    "Atorvastatin",
+    "Metformin",
+    "Lisinopril",
+    "Aspirin",
+    "Metoprolol",
+    "Omeprazole",
+    "Ciprofloxacin",
+    "Losartan",
+    "Levothyroxine",
+    "Warfarin",
+    "Carvedilol",
+    "Furosemide",
+    "Apixaban",
+    "Digoxin",
+    "Hydrochlorothiazide",
+    "Simvastatin",
+    "Gabapentin",
+    "Amlodipine",
+    "Paracetamol",
+    "Metacin",
+    "Aldactone",
+    "Furoped",
+    "Shelcal",
+    "Autrin",
+)
 
 
 # ─── MOCK PROVIDER ───────────────────────────────────────────────────────────
@@ -415,95 +465,146 @@ class MockLLMProvider:
         """Simple heuristic extraction mimicking LLM behavior for test purposes."""
         extractions = []
 
-        # med.name
-        med_m = re.search(
-            r"(?<![-/\w])(Amoxicillin[-/]clavulanate|Atorvastatin|Metformin|Lisinopril|Amoxicillin|Aspirin|Metoprolol|"
-            r"Omeprazole|Ciprofloxacin|Losartan|Levothyroxine|Warfarin|"
-            r"[A-Z][a-z]+(?:[-/][a-zA-Z]+)?)(?![-/\w])",
-            text,
+        # 1. med.name matches
+        # Match known medications OR words directly following prescription verbs/prefixes
+        med_regex_parts = [re.escape(m) for m in _KNOWN_MEDICATIONS]
+        known_med_pattern = re.compile(
+            r"(?<![-/\w])(" + "|".join(med_regex_parts) + r")(?![-/\w])",
             re.IGNORECASE,
         )
-        if med_m:
+        context_med_pattern = re.compile(
+            r"\b(?:Continue|Start|Take|Prescribed|Tab|Cap|Inj|Syp|T\.|C\.)\s+([A-Z][a-z]+(?:[-/][a-zA-Z]+)?)\b",
+            re.IGNORECASE,
+        )
+
+        seen_spans: set[tuple[int, int]] = set()
+
+        # Match known medications
+        for m in known_med_pattern.finditer(text):
+            val = m.group(1)
+            val_clean = val.strip().lower()
+            if val_clean in _NON_MEDICATION_TOKENS:
+                continue
+            span = (m.start(), m.end())
+            seen_spans.add(span)
+            val_canonical = val.strip().capitalize() if not ("/" in val or "-" in val) else val.strip()
             extractions.append({
                 "field_type": "med.name",
-                "value": med_m.group(0),
-                "evidence_text": med_m.group(0),
-                "unit_raw": None,
-                "confidence": 0.82,
-            })
-
-        # med.dose
-        dose_m = re.search(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|mL|g)\b", text, re.IGNORECASE)
-        if dose_m:
-            extractions.append({
-                "field_type": "med.dose",
-                "value": dose_m.group(1),
-                "evidence_text": dose_m.group(0),
-                "unit_raw": dose_m.group(2).lower(),
-                "confidence": 0.85,
-            })
-
-        # med.route
-        route_m = re.search(r"\b(oral|PO|by mouth|inhalation|topical|subcutaneous)\b", text, re.IGNORECASE)
-        if route_m:
-            extractions.append({
-                "field_type": "med.route",
-                "value": route_m.group(0),
-                "evidence_text": route_m.group(0),
+                "value": val_canonical,
+                "evidence_text": m.group(0),
                 "unit_raw": None,
                 "confidence": 0.88,
+                "local_start": m.start(),
+                "local_end": m.end(),
             })
 
-        # med.frequency
-        freq_m = re.search(
-            r"\b(once daily|twice daily|three times daily|BID|TID|QID|every \d+ hours?|daily|as needed)\b",
-            text, re.IGNORECASE,
+        # Match contextual medications
+        for m in context_med_pattern.finditer(text):
+            val = m.group(1)
+            val_clean = val.strip().lower()
+            if val_clean in _NON_MEDICATION_TOKENS:
+                continue
+            m_start = m.start(1)
+            m_end = m.end(1)
+            if (m_start, m_end) in seen_spans:
+                continue
+            seen_spans.add((m_start, m_end))
+            val_canonical = val.strip().capitalize() if not ("/" in val or "-" in val) else val.strip()
+            extractions.append({
+                "field_type": "med.name",
+                "value": val_canonical,
+                "evidence_text": val,
+                "unit_raw": None,
+                "confidence": 0.85,
+                "local_start": m_start,
+                "local_end": m_end,
+            })
+
+        # 2. med.dose matches
+        dose_pattern = re.compile(r"\b(\d+(?:\.\d+)?)\s*(mg|mcg|mL|g|units)\b", re.IGNORECASE)
+        for m in dose_pattern.finditer(text):
+            extractions.append({
+                "field_type": "med.dose",
+                "value": m.group(1),
+                "evidence_text": m.group(0),
+                "unit_raw": m.group(2).lower(),
+                "confidence": 0.88,
+                "local_start": m.start(),
+                "local_end": m.end(),
+            })
+
+        # 3. med.route matches
+        route_pattern = re.compile(r"\b(oral|PO|by mouth|inhalation|topical|subcutaneous|IV|intravenous)\b", re.IGNORECASE)
+        for m in route_pattern.finditer(text):
+            extractions.append({
+                "field_type": "med.route",
+                "value": m.group(0),
+                "evidence_text": m.group(0),
+                "unit_raw": None,
+                "confidence": 0.88,
+                "local_start": m.start(),
+                "local_end": m.end(),
+            })
+
+        # 4. med.frequency matches
+        freq_pattern = re.compile(
+            r"\b(once daily|twice daily|three times daily|BID|TID|QID|every \d+ hours?|daily|as needed|PRN)\b",
+            re.IGNORECASE,
         )
-        if freq_m:
+        for m in freq_pattern.finditer(text):
             extractions.append({
                 "field_type": "med.frequency",
-                "value": freq_m.group(0).lower(),
-                "evidence_text": freq_m.group(0),
+                "value": m.group(0).lower(),
+                "evidence_text": m.group(0),
                 "unit_raw": None,
                 "confidence": 0.86,
+                "local_start": m.start(),
+                "local_end": m.end(),
             })
 
-        # lab.value (quantitative and qualitative per PD-022)
-        lab_m = re.search(
-            r"\b(\d+(?:\.\d+)?)\s*(g/dL|mg/dL|mmol/L|U/L|10\*\d+/\w+|%)\b",
-            text, re.IGNORECASE,
+        # 5. lab.value matches (quantitative)
+        lab_quant_pattern = re.compile(
+            r"\b(\d+(?:\.\d+)?)\s*(g/dL|mg/dL|mmol/L|U/L|10\*\d+/\w+|%|ng/mL|pg/mL)\b",
+            re.IGNORECASE,
         )
-        if lab_m:
+        for m in lab_quant_pattern.finditer(text):
             extractions.append({
                 "field_type": "lab.value",
-                "value": lab_m.group(1),
-                "evidence_text": lab_m.group(0),
-                "unit_raw": lab_m.group(2),
-                "confidence": 0.83,
+                "value": m.group(1),
+                "evidence_text": m.group(0),
+                "unit_raw": m.group(2),
+                "confidence": 0.88,
+                "local_start": m.start(),
+                "local_end": m.end(),
             })
-        else:
-            qual_m = re.search(
-                r"\b(Negative|Positive|Reactive|Non-Reactive|Non Reactive|Nonreactive|Detected|Not Detected|Equivocal)\b",
-                text, re.IGNORECASE,
-            )
-            if qual_m:
-                extractions.append({
-                    "field_type": "lab.value",
-                    "value": qual_m.group(0),
-                    "evidence_text": qual_m.group(0),
-                    "unit_raw": None,
-                    "confidence": 0.90,
-                })
 
-        # lab.flag
-        flag_m = re.search(r"\b(HIGH|LOW|NORMAL|CRITICAL)\b", text)
-        if flag_m:
+        # lab.value matches (qualitative)
+        lab_qual_pattern = re.compile(
+            r"\b(Negative|Positive|Reactive|Non-Reactive|Non Reactive|Nonreactive|Detected|Not Detected|Equivocal)\b",
+            re.IGNORECASE,
+        )
+        for m in lab_qual_pattern.finditer(text):
             extractions.append({
-                "field_type": "lab.flag",
-                "value": flag_m.group(0),
-                "evidence_text": flag_m.group(0),
+                "field_type": "lab.value",
+                "value": m.group(0),
+                "evidence_text": m.group(0),
                 "unit_raw": None,
                 "confidence": 0.90,
+                "local_start": m.start(),
+                "local_end": m.end(),
+            })
+
+        # 6. lab.flag matches
+        flag_pattern = re.compile(r"\b(HIGH|LOW|NORMAL|CRITICAL)\b")
+        for m in flag_pattern.finditer(text):
+            extractions.append({
+                "field_type": "lab.flag",
+                "value": m.group(0),
+                "evidence_text": m.group(0),
+                "unit_raw": None,
+                "confidence": 0.90,
+                "local_start": m.start(),
+                "local_end": m.end(),
             })
 
         return extractions
@@ -988,9 +1089,18 @@ class NarrativeExtractor:
             if ext.get("temporal_status") in perm_temp and temp_status == "unspecified":
                 temp_status = ext["temporal_status"]
 
+            claim_group_id = group_id
+            is_unanchored = (
+                group_id == NO_ANCHOR_SENTINEL
+                or assoc_status_str == AssociationStatus.UNANCHORED_ORPHAN.value
+                or bool(meta.get("orphan"))
+            )
+            if is_unanchored:
+                claim_group_id = "__unanchored_review__"
+
             claim = Claim(
                 document_id=document_id,
-                group_id=group_id,
+                group_id=claim_group_id,
                 field_type=field_type,  # type: ignore[arg-type]
                 value=value.strip(),
                 value_numeric=value_numeric,
@@ -1004,6 +1114,9 @@ class NarrativeExtractor:
 
             # Attach dynamic association metadata to Claim
             object.__setattr__(claim, "association_status", assoc_status_str)
+            if is_unanchored:
+                object.__setattr__(claim, "unanchored", True)
+                object.__setattr__(claim, "review_reason", "unanchored_medication_attribute")
             if meta.get("slot_conflict"):
                 object.__setattr__(claim, "slot_conflict", True)
             if meta.get("provisional"):

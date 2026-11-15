@@ -142,6 +142,7 @@ from clindoc.config import (
     ProductionProfileError,
     RuntimeProfile,
     get_active_profile,
+    validate_production_configuration,
 )
 
 
@@ -281,6 +282,7 @@ def process_document(
             raise ProductionProfileError(
                 "Production profile requires a VerificationCascade initialized with profile=PRODUCTION."
             )
+        validate_production_configuration()
 
     file_path = Path(input_file)
     if not file_path.exists():
@@ -427,6 +429,7 @@ def batch_process(
             raise ProductionProfileError(
                 "Production profile requires a VerificationCascade initialized with profile=PRODUCTION."
             )
+        validate_production_configuration()
 
     in_dir = Path(input_dir)
     if not in_dir.exists() or not in_dir.is_dir():
@@ -571,6 +574,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Optional glob pattern to filter files (e.g. '*.pdf', '*.json')",
     )
 
+    # clindoc eval [run|verify]
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="M-BENCHMARK: Clinical document quality and reliability evaluation suite",
+    )
+    eval_subparsers = eval_parser.add_subparsers(dest="eval_action", help="Evaluation action")
+
+    eval_run_parser = eval_subparsers.add_parser("run", help="Run benchmark across evaluation splits")
+    eval_run_parser.add_argument(
+        "--tier",
+        type=str,
+        choices=["tier1", "all", "full"],
+        default="tier1",
+        help="Evaluation tier: 'tier1' (fast smoke subset) or 'all'/'full' (complete dataset)",
+    )
+    eval_run_parser.add_argument(
+        "--output", "-o",
+        type=str,
+        default=None,
+        help="Path to save output BenchmarkReport JSON file",
+    )
+    eval_run_parser.add_argument(
+        "--gates",
+        type=str,
+        default=None,
+        help="Path to gate thresholds configuration JSON file (defaults to configs/eval_gates.json)",
+    )
+
+    eval_verify_parser = eval_subparsers.add_parser("verify", help="Verify benchmark report against quality gates")
+    eval_verify_parser.add_argument(
+        "--report", "-r",
+        type=str,
+        required=True,
+        help="Path to existing BenchmarkReport JSON file",
+    )
+    eval_verify_parser.add_argument(
+        "--gates",
+        type=str,
+        default=None,
+        help="Path to gate thresholds configuration JSON file (defaults to configs/eval_gates.json)",
+    )
+
     args = parser.parse_args(argv)
 
     if not args.subcommand:
@@ -607,6 +652,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[OK] Batch processing completed. Successfully processed {len(results)} document(s).")
             print(f"     Artifacts saved to: {args.output_dir}")
             return 0
+
+        elif args.subcommand == "eval":
+            from clindoc.eval.harness import run_clinical_benchmark
+            from clindoc.eval.gates import evaluate_gates
+            from clindoc.eval.schema import BenchmarkReport
+
+            gates_p = Path(args.gates) if args.gates else None
+
+            if args.eval_action == "run":
+                print(f"[INFO] Running M-BENCHMARK evaluation (Tier: {args.tier})...")
+                report = run_clinical_benchmark(tier=args.tier, gate_config_path=gates_p)
+                out_path = Path(args.output) if args.output else Path("eval/benchmark_report.json")
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(report.model_dump_json(indent=2))
+                print(f"[OK] Benchmark complete. Report saved to: {out_path}")
+                print(f"     Overall Quality Gates Passed: {report.overall_gates_passed}")
+                for gc in report.gate_checks:
+                    status = "PASS" if gc.passed else "FAIL"
+                    print(f"     [{status}] {gc.metric_name} ({gc.dataset_name}): measured={gc.measured_value}, target={gc.target_threshold}")
+                return 0 if report.overall_gates_passed else 1
+
+            elif args.eval_action == "verify":
+                report_p = Path(args.report)
+                if not report_p.exists():
+                    sys.stderr.write(f"Error: Report file not found: {report_p}\n")
+                    return 1
+                with open(report_p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                report = BenchmarkReport.model_validate(data)
+                gate_checks, passed = evaluate_gates(report, gate_config_path=gates_p)
+                print(f"Quality Gates Verification: {'PASS' if passed else 'FAIL'}")
+                for gc in gate_checks:
+                    status = "PASS" if gc.passed else "FAIL"
+                    print(f"  [{status}] {gc.metric_name} ({gc.dataset_name}): measured={gc.measured_value}, target={gc.target_threshold}")
+                return 0 if passed else 1
+
+            else:
+                eval_parser.print_help()
+                return 1
 
         else:
             parser.print_help()

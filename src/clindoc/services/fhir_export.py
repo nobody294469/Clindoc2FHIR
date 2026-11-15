@@ -26,6 +26,11 @@ from fhir.resources.R4B.bundle import Bundle
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from clindoc.config import (
+    RuntimeProfile,
+    acquire_document_xact_lock,
+    get_active_profile,
+)
 from clindoc.observability.metrics import get_metrics
 
 from clindoc.api.audit.service import AuditService, validate_metadata_phi_free
@@ -33,6 +38,8 @@ from clindoc.db.enums import (
     ClaimReviewState,
     DocumentApprovalStatus,
     DocumentStatus,
+    EHRResolutionStatus,
+    EHRTransmissionState,
     FHIRExportStatus,
     FHIRVersion,
     PatientIdentityApprovalStatus,
@@ -533,7 +540,7 @@ class FHIRExportService:
 
                 # 10b. Check production isolation for unanchored dev ledgers
                 is_unanchored = getattr(ledger_res, "is_unanchored_dev_mode", False) if hasattr(ledger_res, "is_unanchored_dev_mode") else ledger_res.get("is_unanchored_dev_mode", False)
-                is_prod = os.getenv("CLINDOC_ENV", "").lower() == "production"
+                is_prod = get_active_profile() == RuntimeProfile.PRODUCTION
                 if is_unanchored and is_prod:
                     return ClaimEligibilityEvaluation(
                         claim_id=claim_id_str,
@@ -819,10 +826,9 @@ class FHIRExportService:
         user_uuid = uuid.UUID(str(exported_by)) if not isinstance(exported_by, uuid.UUID) else exported_by
         export_start_time = time.perf_counter()
 
-        # 0. Concurrency Serialization (Stage 3.1):
-        # Acquire global advisory transaction lock at transaction start if running on PostgreSQL.
-        # This serializes Gate 9 eligibility checks, claim extraction, and bundle persistence
-        # with all other audit writers throughout the entire database transaction.
+        # 0. Concurrency Serialization:
+        # Acquire document-scoped advisory lock and global audit transaction lock on PostgreSQL.
+        acquire_document_xact_lock(session, doc_uuid)
         bind = session.get_bind()
         if bind is not None and bind.dialect.name == "postgresql":
             session.execute(
@@ -836,11 +842,11 @@ class FHIRExportService:
             get_metrics().record_fhir_export_failure("eligibility_failure", "document_not_found")
             raise FHIRExportNotFoundError(f"Document with ID '{doc_uuid}' not found.")
 
-        # 2. Check Four-Eyes Document Approval Gate
+        # 2. Check Four-Eyes Document Approval Gate & Dynamic Export Eligibility (Phase A)
         latest_approval = (
             session.query(DocumentApproval)
             .filter(DocumentApproval.document_id == doc_uuid)
-            .order_by(DocumentApproval.created_at.desc())
+            .order_by(DocumentApproval.created_at.desc(), DocumentApproval.id.desc())
             .first()
         )
         if not latest_approval:
@@ -857,6 +863,18 @@ class FHIRExportService:
                 f"Document '{doc_uuid}' approval is not export-eligible. "
                 f"Status: {latest_approval.approval_status}, "
                 f"Patient identity: {latest_approval.patient_identity_status} (PD-015)."
+            )
+
+        from clindoc.review.approval import evaluate_export_eligibility
+        is_eligible, reason_msg, _ = evaluate_export_eligibility(
+            session=session,
+            document_id=doc_uuid,
+            keyring=getattr(self, "keyring", None),
+        )
+        if not is_eligible:
+            get_metrics().record_fhir_export_failure("eligibility_failure", "dynamic_eligibility_failure")
+            raise FHIRExportEligibilityError(
+                f"Document '{doc_uuid}' failed dynamic fail-closed export eligibility: {reason_msg}"
             )
 
         # 3. Load active claims for this document
@@ -888,7 +906,8 @@ class FHIRExportService:
             c_id_str = str(c.claim_id)
 
             # Reconstruct Claim Pydantic contract
-            c_payload = dict(c.payload)
+            valid_claim_keys = Claim.model_fields.keys()
+            c_payload = {k: v for k, v in c.payload.items() if k in valid_claim_keys} if c.payload else {}
             c_payload["claim_id"] = c_id_str
             c_payload["document_id"] = str(c.document_id)
             c_contract = Claim.model_validate(c_payload)
@@ -1044,6 +1063,7 @@ class FHIRExportService:
                 "reviewed_at": latest_approval.created_at,
             }
 
+        from clindoc.config import CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM
         from clindoc.fhir.mapper import claims_to_fhir_bundle
         bundle = claims_to_fhir_bundle(
             claims=exportable_claims,
@@ -1052,6 +1072,8 @@ class FHIRExportService:
             document_id=str(doc_uuid),
             document_type=doc_layout_type,
             patient_id=str(doc.patient_context_id) if doc.patient_context_id else None,
+            patient_identifier_system=CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM,
+            allow_synthetic_identity=False,
             document_metadata=doc_metadata,
             review_info=review_info,
             include_document_reference=include_document_reference,
@@ -1171,11 +1193,16 @@ class FHIRExportService:
 
         # 13. Persist FHIRExport record
         idempotency_key = f"export-{doc_uuid}-{transport_sha256}"
+        is_ehr = bool(target_type == "EHR_TRANSMISSION" and destination_path and (str(destination_path).startswith("http") or str(destination_path).startswith("ehr")))
+        actual_target = "EHR_TRANSMISSION" if is_ehr else "FILE_DOWNLOAD"
         export_row = FHIRExport(
             id=export_row_id,
             bundle_id=fhir_bundle_row.id,
-            target_type=target_type,
-            export_status=FHIRExportStatus.EXPORTED_FILE if destination_path else FHIRExportStatus.GENERATED,
+            target_type=actual_target,
+            export_status=FHIRExportStatus.PENDING_TRANSPORT if is_ehr else FHIRExportStatus.GENERATED,
+            transmission_state=EHRTransmissionState.PENDING_TRANSPORT if is_ehr else None,
+            resolution_status=EHRResolutionStatus.UNRESOLVED if is_ehr else None,
+            destination_identity=destination_path if is_ehr else None,
             idempotency_key=idempotency_key,
             destination_path=destination_path,
             exported_by=user_uuid,

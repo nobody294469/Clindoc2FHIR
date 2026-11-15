@@ -3,10 +3,17 @@
 import json
 from pathlib import Path
 import subprocess
+import threading
 import time
 
 from clindoc.ocr.born_digital import extract_born_digital_pdf
 from clindoc.ocr.schema import DocumentOCRRecord
+from clindoc.ocr.hybrid import (
+    ModalityConfig,
+    process_hybrid_pdf,
+    process_image_file,
+)
+from clindoc.ocr.tesseract_runner import TesseractConfig, find_tesseract_binary
 
 
 def _run_isolated_paddleocr(
@@ -47,7 +54,10 @@ def process_document(
     engine: str = "auto",
     use_born_digital: bool = True,
     force: bool = False,
-    dpi: int = 150,
+    dpi: int = 300,
+    tesseract_config: TesseractConfig | None = None,
+    modality_config: ModalityConfig | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> DocumentOCRRecord:
     """Process a single document (PDF or image) and save cached DocumentOCRRecord JSON."""
     input_path = Path(input_path)
@@ -68,11 +78,37 @@ def process_document(
 
     # Determine engine
     resolved_engine = engine
+    suffix = input_path.suffix.lower()
+
     if engine == "auto":
-        resolved_engine = "pymupdf_digital" if (use_born_digital and input_path.suffix.lower() == ".pdf") else "paddleocr"
+        if suffix == ".pdf":
+            resolved_engine = "hybrid" if use_born_digital else "tesseract"
+        else:
+            resolved_engine = "tesseract"
 
     if resolved_engine == "pymupdf_digital":
         record = extract_born_digital_pdf(input_path, doc_id=doc_id)
+        cache_file.write_text(record.model_dump_json(indent=2), encoding="utf-8")
+        return record
+    elif resolved_engine in ("hybrid", "tesseract"):
+        if suffix == ".pdf":
+            force_ocr = (resolved_engine == "tesseract") or not use_born_digital
+            record = process_hybrid_pdf(
+                pdf_path=input_path,
+                doc_id=doc_id,
+                config=tesseract_config,
+                dpi=dpi,
+                force_ocr=force_ocr,
+                modality_config=modality_config,
+                cancellation_event=cancellation_event,
+            )
+        else:
+            record = process_image_file(
+                image_path=input_path,
+                doc_id=doc_id,
+                config=tesseract_config,
+                cancellation_event=cancellation_event,
+            )
         cache_file.write_text(record.model_dump_json(indent=2), encoding="utf-8")
         return record
     elif resolved_engine == "paddleocr":

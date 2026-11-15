@@ -49,7 +49,7 @@ TIER_2_FIELDS: frozenset[str] = frozenset({
 
 ExtractionMethod = Literal["deterministic", "gliner", "llm_narrative"]
 TemporalStatus = Literal["current", "historical", "discontinued", "planned", "unspecified"]
-CodeSystem = Optional[Literal["LOINC", "RxNorm", "UCUM"]]
+CodeSystem = Optional[Literal["LOINC", "RxNorm", "UCUM", "CDCI"]]
 RouteType = Literal["deterministic", "gliner", "llm_narrative"]
 
 

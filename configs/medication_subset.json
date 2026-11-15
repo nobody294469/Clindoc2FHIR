@@ -152,5 +152,26 @@
     "drug_class": "Penicillin / Beta-lactamase inhibitor combination",
     "default_route": "oral",
     "common_forms": ["tablet", "suspension"]
+  },
+  "carvedilol": {
+    "canonical_name": "Carvedilol",
+    "rxcui": "20352",
+    "drug_class": "Beta blocker",
+    "default_route": "oral",
+    "common_forms": ["tablet"]
+  },
+  "apixaban": {
+    "canonical_name": "Apixaban",
+    "rxcui": "1364430",
+    "drug_class": "Factor Xa inhibitor",
+    "default_route": "oral",
+    "common_forms": ["tablet"]
+  },
+  "digoxin": {
+    "canonical_name": "Digoxin",
+    "rxcui": "3407",
+    "drug_class": "Cardiac glycoside",
+    "default_route": "oral",
+    "common_forms": ["tablet", "solution"]
   }
 }

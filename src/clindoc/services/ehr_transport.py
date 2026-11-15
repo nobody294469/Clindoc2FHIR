@@ -73,6 +73,93 @@ class EHRDraftRejectionError(EHRTransportError):
         super().__init__(message, status_code=status_code, error_type="DRAFT_REJECTED")
 
 
+class EHRTransportIdentityViolation(EHRTransportError):
+    """Raised when an EHR transport boundary detects missing, synthetic, or unapproved patient identity."""
+
+    def __init__(
+        self,
+        message: str = "EHR boundary rejected bundle: patient identity is synthetic or invalid for production transmission.",
+        status_code: int = 403,
+    ) -> None:
+        super().__init__(message, status_code=status_code, error_type="IDENTITY_VIOLATION")
+
+
+def assert_valid_patient_identifier_at_boundary(bundle_payload: Union[str, bytes, dict[str, Any]]) -> None:
+    """Verify that bundle contains a verified, non-synthetic patient identity before EHR dispatch.
+
+    Enforces:
+      - If runtime profile is PRODUCTION:
+        - Patient resource must be present in bundle.entry.
+        - Patient.identifier must be present, non-empty.
+        - Patient.identifier.value must not match 'SYNTHETIC-PATIENT-*' or 'patient-*'.
+        - Patient.identifier.system must be in get_allowed_patient_identifier_systems().
+    """
+    profile = os.environ.get("CLINDOC_PROFILE", "dev").strip().lower()
+    if profile not in ("production", "prod"):
+        return
+
+    from clindoc.config import get_allowed_patient_identifier_systems
+
+    if isinstance(bundle_payload, bytes):
+        data = json.loads(bundle_payload.decode("utf-8"))
+    elif isinstance(bundle_payload, str):
+        data = json.loads(bundle_payload)
+    elif isinstance(bundle_payload, dict):
+        data = bundle_payload
+    else:
+        if hasattr(bundle_payload, "dict"):
+            data = bundle_payload.dict()
+        else:
+            raise EHRTransportIdentityViolation("Invalid bundle payload type at transport boundary.")
+
+    entries = data.get("entry") or []
+    patient_resources = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            res = entry.get("resource")
+            if isinstance(res, dict) and res.get("resourceType") == "Patient":
+                patient_resources.append(res)
+
+    if not patient_resources:
+        raise EHRTransportIdentityViolation(
+            "EHR boundary rejected bundle: No Patient resource found in production dispatch bundle."
+        )
+
+    allowed_systems = set(get_allowed_patient_identifier_systems())
+
+    for pat in patient_resources:
+        identifiers = pat.get("identifier") or []
+        if isinstance(identifiers, dict):
+            identifiers = [identifiers]
+        if not identifiers:
+            raise EHRTransportIdentityViolation(
+                "EHR boundary rejected bundle: Patient resource lacks mandatory identifier in production."
+            )
+
+        valid_identifier_found = False
+        for ident in identifiers:
+            if not isinstance(ident, dict):
+                continue
+            val = str(ident.get("value") or "").strip()
+            sys_uri = str(ident.get("system") or "").strip()
+
+            val_lower = val.lower()
+            if val_lower.startswith("synthetic-patient-") or val_lower.startswith("patient-"):
+                raise EHRTransportIdentityViolation(
+                    f"EHR boundary rejected bundle: Synthetic placeholder patient identifier '{val}' "
+                    "is strictly forbidden in production EHR dispatch."
+                )
+
+            if sys_uri and sys_uri in allowed_systems and val:
+                valid_identifier_found = True
+
+        if not valid_identifier_found:
+            raise EHRTransportIdentityViolation(
+                f"EHR boundary rejected bundle: Patient identifiers {identifiers} do not contain an approved system "
+                f"from {sorted(allowed_systems)}."
+            )
+
+
 def assert_no_draft_tags(bundle_payload: Union[str, bytes, dict[str, Any]]) -> None:
     """Verify that a bundle does not carry unreviewed CLI draft tags or draft identifier (DEF-004 Tier 3).
 
@@ -80,7 +167,9 @@ def assert_no_draft_tags(bundle_payload: Union[str, bytes, dict[str, Any]]) -> N
       - Bundle.meta.tag containing code 'UNREVIEWED_CLI_DRAFT' or 'UNAUTHORIZED_RESEARCH_DRAFT'
       - Bundle.meta.tag containing system 'http://clindoc.org/fhir/tag/governance-status' or 'http://clindoc.org/fhir/tag/export-authorization'
       - Bundle.identifier containing 'UNAUTHORIZED_RESEARCH_DRAFT' or system 'http://clindoc.org/fhir/identifier/export-authorization'
+      - In production, rejects invalid/synthetic patient identities.
     """
+    assert_valid_patient_identifier_at_boundary(bundle_payload)
     if isinstance(bundle_payload, bytes):
         payload_str = bundle_payload.decode("utf-8")
         data = json.loads(payload_str)
@@ -337,6 +426,12 @@ class HTTPFHIRTransportConfig:
                 raise ValueError("Production security violation: EHR endpoint MUST use HTTPS.")
             if not self.ssl_verify:
                 raise ValueError("Production security violation: " + "ssl_verify=" + "False is strictly forbidden in production.")
+            if self.destination_type in ("production", "live"):
+                from clindoc.config import ProductionProfileError
+                raise ProductionProfileError(
+                    "Real HTTP EHR dispatch is strictly disabled in PRODUCTION profile pending Phase 9 migration; "
+                    "only in-memory MockFHIRTransport is permitted."
+                )
 
 
 class HTTPFHIRTransport(FHIRTransport):
@@ -364,6 +459,13 @@ class HTTPFHIRTransport(FHIRTransport):
         expected_transport_sha256: Optional[str] = None,
     ) -> EHRTransmissionResponse:
         """Transmit FHIR Bundle over HTTP/HTTPS to the configured EHR endpoint."""
+        from clindoc.config import RuntimeProfile, get_active_profile, ProductionProfileError
+        if get_active_profile() == RuntimeProfile.PRODUCTION:
+            raise ProductionProfileError(
+                "Real HTTP EHR dispatch is strictly disabled in PRODUCTION profile pending Phase 9 migration; "
+                "only in-memory MockFHIRTransport is permitted."
+            )
+
         assert_no_draft_tags(bundle_json)
 
         if expected_transport_sha256 is not None:

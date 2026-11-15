@@ -58,6 +58,14 @@ __all__ = [
     "EHRDuplicateSubmissionError",
     "EHRDraftRejectionError",
     "assert_no_draft_tags",
+    # Reconciliation (Phase A Milestone 3)
+    "ReconciliationService",
+    "ReconciliationError",
+    "ReconciliationAuthorizationError",
+    "ReconciliationValidationError",
+    "ReconciliationNotFoundError",
+    "ReconciliationTokenAlreadyConsumedError",
+    "ReconciliationTokenRevokedError",
 ]
 
 from clindoc.services.fhir_export import FHIRExportService
@@ -81,5 +89,22 @@ from clindoc.services.ehr_integration import (
     EHRPatientIdentityError,
     EHRTransmissionResult,
     EHRUnresolvedClaimError,
+)
+from clindoc.services.reconciliation_service import (
+    ReconciliationAuthorizationError,
+    ReconciliationError,
+    ReconciliationNotFoundError,
+    ReconciliationService,
+    ReconciliationTokenAlreadyConsumedError,
+    ReconciliationTokenRevokedError,
+    ReconciliationValidationError,
+)
+from clindoc.services.outbox_service import (
+    EHROutboxService,
+    OutboxConflictError,
+    OutboxError,
+    OutboxIntentNotFoundError,
+    OutboxStagingResult,
+    StaleWorkerLeaseError,
 )
 

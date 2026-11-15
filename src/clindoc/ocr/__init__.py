@@ -14,6 +14,27 @@ from clindoc.ocr.born_digital import extract_born_digital_pdf
 from clindoc.ocr.layout import sort_page_lines_reading_order
 from clindoc.ocr.table_layout import detect_tabular_layout, reconstruct_tabular_page_text
 from clindoc.ocr.pipeline import process_document, batch_process_dataset
+from clindoc.ocr.preprocessing import (
+    AffineMatrix,
+    OrientationResult,
+    detect_orientation_osd,
+    estimate_skew_angle,
+    preprocess_page_image,
+)
+from clindoc.ocr.tesseract_runner import (
+    TesseractConfig,
+    find_tesseract_binary,
+    check_tesseract_readiness,
+    run_tesseract_tsv,
+    parse_tesseract_tsv,
+)
+from clindoc.ocr.hybrid import (
+    PageModality,
+    ModalityConfig,
+    detect_page_modality,
+    process_hybrid_pdf,
+    process_image_file,
+)
 
 __all__ = [
     # Canonical DocumentText contract & geometry
@@ -43,4 +64,20 @@ __all__ = [
     "reconstruct_tabular_page_text",
     "process_document",
     "batch_process_dataset",
+    # M-OCR Scanned & Preprocessing Pipeline
+    "AffineMatrix",
+    "OrientationResult",
+    "detect_orientation_osd",
+    "estimate_skew_angle",
+    "preprocess_page_image",
+    "TesseractConfig",
+    "find_tesseract_binary",
+    "check_tesseract_readiness",
+    "run_tesseract_tsv",
+    "parse_tesseract_tsv",
+    "PageModality",
+    "ModalityConfig",
+    "detect_page_modality",
+    "process_hybrid_pdf",
+    "process_image_file",
 ]

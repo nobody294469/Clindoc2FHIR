@@ -56,6 +56,11 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from clindoc.config import (
+    RuntimeProfile,
+    acquire_document_xact_lock,
+    get_active_profile,
+)
 from clindoc.api.audit.service import (
     AuditService,
     AuditServiceError,
@@ -79,6 +84,7 @@ from clindoc.db.enums import (
     ClaimOrigin,
     ClaimReviewState,
     ContradictionType as DBContradictionType,
+    DocumentStatus,
     ReviewActionType,
     VerificationLabel as DBVerificationLabel,
     VerificationStage as DBVerificationStage,
@@ -173,6 +179,11 @@ class InvalidClaimLifecycleStateError(InvalidStateTransitionError):
 
 class StaleDocumentVersionError(ClaimReviewServiceError, ValueError):
     """Raised when a review action references a stale document content hash."""
+
+
+class InvalidDocumentStateError(ClaimReviewServiceError, ValueError):
+    """Raised when a review action is attempted on a document outside PENDING_REVIEW or IN_REVIEW."""
+
 
 
 class AuditLedgerVerificationError(ClaimReviewServiceError, ValueError):
@@ -352,7 +363,7 @@ class ReviewAuditLedger:
         checkpoint_path: Optional[Union[str, Path]] = None,
         document_id: Optional[str] = None,
         document_sha256: Optional[str] = None,
-        signing_key_id: str = "default",
+        signing_key_id: Optional[str] = None,
         keyring: Optional[dict[str, bytes]] = None,
         hmac_key: Optional[bytes] = None,
     ) -> None:
@@ -363,10 +374,15 @@ class ReviewAuditLedger:
             self.checkpoint_path = self.ledger_path.with_suffix(".chkpt")
         self.document_id = str(document_id) if document_id else ""
         self.document_sha256 = str(document_sha256) if document_sha256 else ""
-        self.signing_key_id = signing_key_id
+        resolved_key_id = (
+            signing_key_id.strip()
+            if signing_key_id is not None and signing_key_id.strip()
+            else os.getenv("CLINDOC_AUDIT_HMAC_KEY_ID", "default").strip()
+        )
+        self.signing_key_id = resolved_key_id
         self.keyring: dict[str, bytes] = dict(keyring or {})
         if hmac_key:
-            self.keyring[signing_key_id] = hmac_key
+            self.keyring[self.signing_key_id] = hmac_key
 
     def _resolve_key(self, key_id: str, keyring: Optional[dict[str, bytes]] = None) -> Optional[bytes]:
         """Resolve HMAC key from parameter keyring, instance keyring, or environment."""
@@ -374,7 +390,11 @@ class ReviewAuditLedger:
             return keyring[key_id]
         if key_id in self.keyring:
             return self.keyring[key_id]
-        env_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{key_id.upper()}") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+        if key_id.lower() == "default":
+            env_key = os.getenv("CLINDOC_AUDIT_HMAC_KEY_DEFAULT") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+        else:
+            # Explicit non-default IDs must resolve ONLY their corresponding key (fail closed; never fallback)
+            env_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{key_id.upper()}")
         if env_key:
             return env_key.encode("utf-8")
         return None
@@ -702,7 +722,7 @@ class ReviewAuditLedger:
 
         # Checkpoint verification
         checkpoint_verified = False
-        is_prod = os.getenv("CLINDOC_ENV", "").lower() == "production"
+        is_prod = (get_active_profile() == RuntimeProfile.PRODUCTION) or (os.getenv("CLINDOC_ENV", "").lower() == "production")
 
         if self.checkpoint_path.exists():
             try:
@@ -966,6 +986,10 @@ class ClaimReviewService:
         # Capture in-memory payload and custom attributes from target_claim
         target_in_mem_payload = copy.deepcopy(target_claim.payload) if target_claim.payload else {}
         target_in_mem_assoc = getattr(target_claim, "association_status", None)
+
+        # 1b. Universal Document Advisory Lock to maintain strict lock hierarchy
+        if target_claim.document_id is not None:
+            acquire_document_xact_lock(session, target_claim.document_id)
 
         # 2. Universal Lineage Root Mutex on v1:
         # In SQLite with_for_update() is a no-op; in PostgreSQL it executes SELECT ... FOR UPDATE
@@ -1311,21 +1335,27 @@ class ClaimReviewService:
         session: Session,
         expected_document_sha256: Optional[str] = None,
     ) -> None:
-        """Validate that the review action binds to the active document content SHA-256 (Addendum §4.5)."""
-        if expected_document_sha256 is None:
-            return
+        """Validate document lock, origin-state whitelist, and active content binding."""
         if claim.document_id is not None:
+            acquire_document_xact_lock(session, claim.document_id)
             try:
                 doc = session.get(Document, claim.document_id)
             except Exception:
                 doc = None
             if doc is not None:
-                actual_sha = getattr(doc, "sha256", None) or getattr(doc, "document_sha256", None)
-                if actual_sha and str(actual_sha).strip() != str(expected_document_sha256).strip():
-                    raise StaleDocumentVersionError(
-                        f"Stale document hash mismatch for document '{doc.id}': "
-                        f"expected {expected_document_sha256}, but active document has {actual_sha}."
+                status_val = doc.status.value if hasattr(doc.status, "value") else str(doc.status)
+                if status_val not in (DocumentStatus.PENDING_REVIEW.value, DocumentStatus.IN_REVIEW.value):
+                    raise InvalidDocumentStateError(
+                        f"Cannot review or mutate claim '{claim.claim_id}' for document '{doc.id}' in '{status_val}' state. "
+                        "Review actions are strictly restricted to PENDING_REVIEW or IN_REVIEW."
                     )
+                if expected_document_sha256 is not None:
+                    actual_sha = getattr(doc, "sha256", None) or getattr(doc, "document_sha256", None)
+                    if actual_sha and str(actual_sha).strip() != str(expected_document_sha256).strip():
+                        raise StaleDocumentVersionError(
+                            f"Stale document hash mismatch for document '{doc.id}': "
+                            f"expected {expected_document_sha256}, but active document has {actual_sha}."
+                        )
 
     def _record_audit_event(
         self,
@@ -2022,12 +2052,23 @@ class ClaimReviewService:
                 target = self._resolve_claim(session, raw_cid, exp_ver)
                 resolved_items.append((target, item))
 
-            # 2. Extract unique stable lineage IDs and sort alphanumerically to prevent deadlocks
+            # 2. Pre-acquire document advisory locks in deterministic sorted order
+            # CRITICAL CONCURRENCY INVARIANT: Document transaction locks MUST be acquired
+            # BEFORE any row-level SELECT ... FOR UPDATE on Claim genesis roots to strictly preserve
+            # universal lock hierarchy (Document Advisory Lock -> Claim Genesis Row Lock)
+            # and prevent deadlocks with concurrent single-claim reviews or document approvals.
+            unique_doc_ids = sorted(
+                list({str(target.document_id) for target, _ in resolved_items if target.document_id is not None})
+            )
+            for doc_id_str in unique_doc_ids:
+                acquire_document_xact_lock(session, doc_id_str)
+
+            # 3. Extract unique stable lineage IDs and sort alphanumerically to prevent deadlocks
             unique_lineages = sorted(
                 list({str(target.claim_id) for target, _ in resolved_items})
             )
 
-            # 3. Pre-acquire root locks on genesis version 1 for all lineages in deterministic order
+            # 4. Pre-acquire root locks on genesis version 1 for all lineages in deterministic order
             for lin_id_str in unique_lineages:
                 lin_uuid = uuid.UUID(lin_id_str)
                 root_claim = (
@@ -2042,7 +2083,7 @@ class ClaimReviewService:
                         f"Corrupted claim ancestry: Genesis version 1 for lineage '{lin_uuid}' not found."
                     )
 
-            # 4. Execute each review action within the transaction
+            # 5. Execute each review action within the transaction
             results: list[Union[Claim, EditClaimResult]] = []
             for target, item in resolved_items:
                 action_type = str(item.get("action", "")).upper()

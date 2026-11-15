@@ -521,16 +521,25 @@ class AuditProjectionEngine:
         if sequence_number <= 0:
             return False
 
+        resolved_key_id = (
+            key_id.strip()
+            if key_id is not None and key_id.strip()
+            else os.getenv("CLINDOC_AUDIT_HMAC_KEY_ID", "default").strip()
+        )
+
         secret = hmac_key
-        if secret is None and keyring and key_id in keyring:
-            secret = keyring[key_id]
+        if secret is None and keyring and resolved_key_id in keyring:
+            secret = keyring[resolved_key_id]
         if secret is None:
-            env_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{key_id.upper()}") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+            if resolved_key_id.lower() == "default":
+                env_key = os.getenv("CLINDOC_AUDIT_HMAC_KEY_DEFAULT") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+            else:
+                env_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{resolved_key_id.upper()}")
             if env_key:
                 secret = env_key.encode("utf-8")
 
         if not secret:
-            logger.debug("HMAC key '%s' not available; checkpoint update omitted.", key_id)
+            logger.debug("HMAC key '%s' not available; checkpoint update omitted.", resolved_key_id)
             return False
 
         # If existing checkpoint is already at or beyond this sequence, check if update needed
@@ -548,7 +557,7 @@ class AuditProjectionEngine:
             document_sha256=document_sha256 or "unknown",
             checkpoint_sequence=sequence_number,
             terminal_hash=terminal_hash,
-            key_id=key_id,
+            key_id=resolved_key_id,
         )
         sig = _compute_checkpoint_signature(payload, secret)
         chkpt_data = {
@@ -667,6 +676,9 @@ class AuditProjectionEngine:
             except Exception as exc:
                 raise IncompleteAttestationError(f"Incomplete Attestation: HMAC checkpoint file '{c_path}' is unparseable: {exc}") from exc
 
+            # Extract key_id from checkpoint payload
+            chkpt_key_id = payload.get("key_id") or (key_id.strip() if key_id else None) or "default"
+
             chkpt_seq = int(payload.get("checkpoint_sequence", 0))
             if chkpt_seq < audit_seq:
                 raise IncompleteAttestationError(
@@ -674,17 +686,24 @@ class AuditProjectionEngine:
                 )
 
             secret = hmac_key
-            if secret is None and keyring and key_id in keyring:
-                secret = keyring[key_id]
+            if secret is None and keyring and chkpt_key_id in keyring:
+                secret = keyring[chkpt_key_id]
             if secret is None:
-                env_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{key_id.upper()}") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+                if chkpt_key_id.lower() == "default":
+                    env_key = os.getenv("CLINDOC_AUDIT_HMAC_KEY_DEFAULT") or os.getenv("CLINDOC_AUDIT_HMAC_KEY")
+                else:
+                    env_key = os.getenv(f"CLINDOC_AUDIT_HMAC_KEY_{chkpt_key_id.upper()}")
                 if env_key:
                     secret = env_key.encode("utf-8")
 
-            if secret:
-                expected_sig = _compute_checkpoint_signature(payload, secret)
-                if sig != expected_sig:
-                    raise IncompleteAttestationError("HMAC checkpoint signature verification failed.")
+            if not secret:
+                raise IncompleteAttestationError(
+                    f"Incomplete Attestation: HMAC signing key '{chkpt_key_id}' not found in keyring or environment."
+                )
+
+            expected_sig = _compute_checkpoint_signature(payload, secret)
+            if sig != expected_sig:
+                raise IncompleteAttestationError("HMAC checkpoint signature verification failed.")
 
         # 6. Tier 3 Immutable Serialization
         exact_bytes, transport_sha256 = serialize_transport_payload(bundle_dict)

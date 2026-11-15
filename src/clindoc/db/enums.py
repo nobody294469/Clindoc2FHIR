@@ -121,10 +121,49 @@ class FHIRVersion(str, Enum):
 class FHIRExportStatus(str, Enum):
     """Status of FHIR bundle export execution."""
 
+    PENDING = "PENDING"
+    PENDING_TRANSPORT = "PENDING_TRANSPORT"
     GENERATED = "GENERATED"
     EXPORTED_FILE = "EXPORTED_FILE"
     TRANSMITTED = "TRANSMITTED"
     FAILED = "FAILED"
+    COMPLETED = "COMPLETED"
+
+
+class EHRTransmissionState(str, Enum):
+    """Transmission lifecycle state for EHR exports (Phase A)."""
+
+    PENDING_TRANSPORT = "PENDING_TRANSPORT"
+    TRANSMITTED = "TRANSMITTED"
+    CONFIRMED_FAILED = "CONFIRMED_FAILED"
+    UNKNOWN_RECONCILIATION_REQUIRED = "UNKNOWN_RECONCILIATION_REQUIRED"
+    HISTORICAL_INDETERMINATE = "HISTORICAL_INDETERMINATE"
+
+
+class EHRResolutionStatus(str, Enum):
+    """Delivery resolution status for EHR exports (Phase A)."""
+
+    UNRESOLVED = "UNRESOLVED"
+    RESOLVED_DELIVERED = "RESOLVED_DELIVERED"
+    RESOLVED_NON_DELIVERY = "RESOLVED_NON_DELIVERY"
+
+
+class ReconciliationDecision(str, Enum):
+    """Authorized clinical decisions for ambiguous EHR transmission reconciliation (Phase A)."""
+
+    CONFIRMED_NON_DELIVERY_SAFE_TO_RETRY = "CONFIRMED_NON_DELIVERY_SAFE_TO_RETRY"
+    CONFIRMED_DELIVERED_EXTERNAL_RECORD_FOUND = "CONFIRMED_DELIVERED_EXTERNAL_RECORD_FOUND"
+    REJECTED_PERMANENT_ERROR_DO_NOT_RETRY = "REJECTED_PERMANENT_ERROR_DO_NOT_RETRY"
+
+
+class OutboxStatus(str, Enum):
+    """Lifecycle status of a transactional EHR transmission outbox intent (Phase B1)."""
+
+    PENDING = "PENDING"
+    DISPATCHING = "DISPATCHING"
+    DELIVERED = "DELIVERED"
+    BLOCKED_RECONCILIATION = "BLOCKED_RECONCILIATION"
+    FAILED_TERMINAL = "FAILED_TERMINAL"
 
 
 class JobStatus(str, Enum):

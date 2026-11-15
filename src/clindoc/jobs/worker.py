@@ -19,16 +19,25 @@ Implements Phase 8.3 Task 3B Step 1:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import inspect
 import logging
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Optional, Sequence
 import uuid
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from clindoc.config import ProductionProfileError, RuntimeProfile, get_active_profile
+from clindoc.config import (
+    ProductionProfileError,
+    RuntimeProfile,
+    get_active_profile,
+    validate_daemon_profile,
+)
 from clindoc.db.enums import (
     ClaimOrigin,
     ClaimReviewState,
@@ -54,7 +63,12 @@ from clindoc.extract.contracts import (
     Evidence as ContractEvidence,
 )
 from clindoc.extract.router import ExtractionRouter
+from clindoc.extract.medication_association import NO_ANCHOR_SENTINEL, AssociationStatus
 from clindoc.normalize.normalizer import TerminologyNormalizer
+from clindoc.terminology.service import (
+    TerminologyRetrievalService,
+    get_process_terminology_service,
+)
 from clindoc.verify.cascade import VerificationCascade
 from clindoc.jobs.queue import (
     InvalidStateTransitionError,
@@ -150,6 +164,94 @@ class ModernBERTUnavailableError(WorkerError):
     pass
 
 
+class StaleWorkerFencedError(WorkerError):
+    """Raised when worker detects its lease has expired, been stolen, or reclaimed."""
+    pass
+
+
+class LeaseHeartbeatThread:
+    """Proactive background lease heartbeat thread for running jobs.
+
+    Regularly renews the job lease using atomic CAS predicate (id, worker_id, attempts, RUNNING, not expired).
+    If renewal fails or worker is fenced out, marks is_fenced and terminates.
+    """
+
+    def __init__(
+        self,
+        session_factory: Callable[[], Session],
+        queue: JobQueue,
+        job_id: uuid.UUID,
+        worker_id: str,
+        claimed_attempts: int,
+        lease_seconds: int = 60,
+        heartbeat_interval: Optional[float] = None,
+        on_fenced: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.queue = queue
+        self.job_id = job_id
+        self.worker_id = worker_id
+        self.claimed_attempts = claimed_attempts
+        self.lease_seconds = lease_seconds
+        self.heartbeat_interval = heartbeat_interval or max(1.0, lease_seconds / 3.0)
+        self.on_fenced = on_fenced
+        self._stop_event = threading.Event()
+        self._fenced = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"heartbeat-{self.worker_id}-{str(self.job_id)[:8]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(self.heartbeat_interval):
+                break
+            try:
+                with self.session_factory() as sess:
+                    renewed = self.queue.renew_lease(
+                        session=sess,
+                        job_id=self.job_id,
+                        worker_id=self.worker_id,
+                        claimed_attempts=self.claimed_attempts,
+                        lease_seconds=self.lease_seconds,
+                    )
+                    if renewed:
+                        sess.commit()
+                    else:
+                        logger.warning(
+                            "Lease renewal CAS failed for job %s: worker %s (attempt %d) is fenced out.",
+                            self.job_id,
+                            self.worker_id,
+                            self.claimed_attempts,
+                        )
+                        self._fenced.set()
+                        if self.on_fenced:
+                            try:
+                                self.on_fenced()
+                            except Exception as fe_exc:
+                                logger.warning("Error in on_fenced callback: %s", fe_exc)
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "Heartbeat encounter exception renewing lease for job %s: %s",
+                    self.job_id,
+                    exc,
+                )
+
+    def is_fenced(self) -> bool:
+        return self._fenced.is_set()
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+
 class DocumentProcessingWorker:
     """Background worker executing the clinical document verification cascade.
 
@@ -168,20 +270,140 @@ class DocumentProcessingWorker:
         normalizer: Optional[TerminologyNormalizer] = None,
         cascade: Optional[VerificationCascade] = None,
         stop_after_stage: Optional[str] = None,
+        session_factory: Optional[Callable[[], Session]] = None,
+        terminology_service: Optional[TerminologyRetrievalService] = None,
+        terminology_dir: Optional[Union[Path, str]] = None,
+        use_scaled_terminology: bool = True,
+        owns_terminology_service: bool = False,
     ) -> None:
         self.queue = queue or JobQueue()
         self.blob_store = blob_store
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.lease_seconds = lease_seconds
+        self.session_factory = session_factory
+        self._active_heartbeat: Optional[LeaseHeartbeatThread] = None
         self.ingest_fn = ingest_fn or ingest_document
         self.router = router or ExtractionRouter()
-        self.normalizer = normalizer or TerminologyNormalizer()
         self.cascade = cascade or VerificationCascade()
         self.stop_after_stage = stop_after_stage
+        self.terminology_dir = terminology_dir
+        self._owns_terminology_service = owns_terminology_service
+
+        if normalizer is not None:
+            self.normalizer = normalizer
+            existing_service = getattr(normalizer, "retrieval_service", None)
+
+            if existing_service is not None and terminology_service is not None:
+                # Case D: Both supplied; raise error if conflicting
+                if existing_service is not terminology_service:
+                    raise ValueError(
+                        "Conflicting terminology services provided: supplied normalizer already contains "
+                        "a retrieval service that differs from the explicit terminology_service argument."
+                    )
+                self.terminology_service = terminology_service
+            elif existing_service is not None and terminology_service is None:
+                # Case E: Explicit normalizer already containing service; no explicit service
+                self.terminology_service = existing_service
+            elif existing_service is None and terminology_service is not None:
+                # Case C: Explicit normalizer without service; inject supplied service into normalizer
+                normalizer.retrieval_service = terminology_service
+                self.terminology_service = terminology_service
+            else:
+                # Case B: Explicit normalizer with no service anywhere (legacy fallback)
+                self.terminology_service = None
+        else:
+            # Case A: No explicit normalizer
+            if terminology_service is not None:
+                self.terminology_service = terminology_service
+            elif use_scaled_terminology:
+                self.terminology_service = get_process_terminology_service(data_dir=terminology_dir)
+            else:
+                self.terminology_service = None
+
+            # Construct worker-local normalizer instance to ensure mutable audit state is not shared across jobs
+            self.normalizer = TerminologyNormalizer(retrieval_service=self.terminology_service)
+
         self.last_ocr_output: Optional[DocumentText] = None
         self.last_extraction_output: Optional[DocumentExtractionOutput] = None
         self.last_normalized_claims: Optional[list[Any]] = None
         self.last_verification_output: Optional[list[Any]] = None
+
+    def close(self) -> None:
+        """Release worker resources, active heartbeat threads, and owned services."""
+        if self._active_heartbeat:
+            self._active_heartbeat.stop()
+            self._active_heartbeat = None
+        if self._owns_terminology_service and self.terminology_service:
+            self.terminology_service.close()
+            self.terminology_service = None
+
+    def _resolve_session_factory(self, session: Optional[Session] = None) -> Optional[Callable[[], Session]]:
+        """Resolve a sessionmaker callable from instance, session, or global state."""
+        if self.session_factory:
+            return self.session_factory
+        if session and hasattr(session, "session_factory") and session.session_factory:
+            return session.session_factory
+        if session and session.get_bind() is not None:
+            from sqlalchemy.orm import sessionmaker
+            return sessionmaker(bind=session.get_bind())
+        return None
+
+    def _check_fenced(self, session: Session, job: ProcessingJob, claimed_attempts: int) -> None:
+        """Enforce fencing check. Raises StaleWorkerFencedError if worker no longer holds an active, valid lease."""
+        if self._active_heartbeat and self._active_heartbeat.is_fenced():
+            raise StaleWorkerFencedError(
+                f"Worker {self.worker_id} was fenced out by heartbeat monitor for job {job.id}."
+            )
+
+        now = datetime.now(timezone.utc)
+        stmt = (
+            select(ProcessingJob.id)
+            .where(
+                ProcessingJob.id == job.id,
+                ProcessingJob.worker_id == self.worker_id,
+                ProcessingJob.attempts == claimed_attempts,
+                ProcessingJob.status == JobStatus.RUNNING,
+                ProcessingJob.lease_expires_at > now,
+            )
+        )
+        row = session.scalars(stmt).first()
+        if row is None:
+            raise StaleWorkerFencedError(
+                f"Worker {self.worker_id} (attempt {claimed_attempts}) is fenced out for job {job.id}: lease expired or reclaimed."
+            )
+
+    @staticmethod
+    def _callable_supports_cancellation(fn: Any) -> bool:
+        """Determine whether an ingestion callable supports the `cancellation_event` keyword argument.
+
+        Must return True only when:
+        - `cancellation_event` is declared as POSITIONAL_OR_KEYWORD or KEYWORD_ONLY, or
+        - the callable accepts `**kwargs` (VAR_KEYWORD).
+
+        A positional-only `cancellation_event` is NOT keyword-compatible and returns False.
+        """
+        if not callable(fn):
+            return False
+        try:
+            sig = inspect.signature(fn)
+            has_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if has_var_keyword:
+                return True
+
+            for p in sig.parameters.values():
+                if p.name == "cancellation_event":
+                    if p.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    ):
+                        return True
+                    # Positional-only parameter named 'cancellation_event'
+                    return False
+            return False
+        except (ValueError, TypeError):
+            return False
 
     def _verify_modernbert_availability(self) -> None:
         """Enforce F-05: ModernBERT is mandatory. If unavailable/unloadable, refuse to process."""
@@ -319,6 +541,13 @@ class DocumentProcessingWorker:
 
     def process_job(self, session: Session, job: ProcessingJob) -> ProcessingJob:
         """Execute the sequential pipeline lifecycle for a claimed job."""
+        if job not in session:
+            attached_job = session.get(ProcessingJob, job.id)
+            if attached_job is not None:
+                job = attached_job
+            else:
+                job = session.merge(job)
+
         if job.status != JobStatus.RUNNING:
             raise InvalidStateTransitionError(
                 f"Worker cannot process job {job.id} with status '{job.status}'. Expected 'RUNNING'."
@@ -358,17 +587,34 @@ class DocumentProcessingWorker:
 
         temp_path: Optional[Path] = None
         is_temp = False
+        heartbeat: Optional[LeaseHeartbeatThread] = None
 
         try:
+            session_factory = self._resolve_session_factory(session)
+            if session_factory:
+                heartbeat = LeaseHeartbeatThread(
+                    session_factory=session_factory,
+                    queue=self.queue,
+                    job_id=job.id,
+                    worker_id=self.worker_id,
+                    claimed_attempts=job.attempts,
+                    lease_seconds=self.lease_seconds or 60,
+                    on_fenced=lambda: getattr(self, "daemon", None).reap_subprocesses() if getattr(self, "daemon", None) else None,
+                )
+                self._active_heartbeat = heartbeat
+                heartbeat.start()
+
             self._verify_modernbert_availability()
             temp_path, is_temp = self._prepare_scratch_file(document)
 
             # ─── SEQUENTIAL ORCHESTRATION SKELETON ───────────────────────────
             # Stage 1: Ingestion / OCR
+            self._check_fenced(session, job, job.attempts)
             ocr_output = self._orchestrate_ocr_stage(session, job, document, temp_path)
             self.last_ocr_output = ocr_output
 
             # Stage 2: Extraction
+            self._check_fenced(session, job, job.attempts)
             extraction_output = self._orchestrate_extraction_stage(session, job, document, ocr_output)
             self.last_extraction_output = extraction_output
 
@@ -378,6 +624,7 @@ class DocumentProcessingWorker:
                 return job
 
             # Stage 3: Normalization
+            self._check_fenced(session, job, job.attempts)
             normalized_claims = self._orchestrate_normalization_stage(
                 session=session,
                 job=job,
@@ -392,6 +639,7 @@ class DocumentProcessingWorker:
                 return job
 
             # Stage 4: Verification Cascade
+            self._check_fenced(session, job, job.attempts)
             verification_output = self._orchestrate_verification_stage(
                 session=session,
                 job=job,
@@ -407,11 +655,13 @@ class DocumentProcessingWorker:
                 return job
 
             # Stage 5: Persistence
+            self._check_fenced(session, job, job.attempts)
             self._orchestrate_persistence_stage(
                 session, job, document, extraction_output, normalized_claims, verification_output
             )
 
             # On successful completion:
+            self._check_fenced(session, job, job.attempts)
             document.status = DocumentStatus.PENDING_REVIEW
             job.current_stage = "COMPLETED"
             session.flush()
@@ -419,6 +669,10 @@ class DocumentProcessingWorker:
             get_metrics().record_job_completed(job_duration)
             get_metrics().record_document_status("pending_review")
             return self.queue.mark_completed(session=session, job_id=job.id)
+
+        except StaleWorkerFencedError as fe:
+            logger.warning("Fenced out during processing for job %s: %s", job.id, fe)
+            raise
 
         except ModernBERTUnavailableError as mb_exc:
             logger.error("F-05 ModernBERT unavailable/unloadable for job %s: %s", job.id, mb_exc)
@@ -535,6 +789,9 @@ class DocumentProcessingWorker:
                 get_metrics().record_document_status("failed")
             return res
         finally:
+            if heartbeat:
+                heartbeat.stop()
+                self._active_heartbeat = None
             if is_temp and temp_path and temp_path.exists():
                 import gc
                 gc.collect()
@@ -622,12 +879,44 @@ class DocumentProcessingWorker:
             if document.original_filename and document.original_filename.upper().startswith("LAB_"):
                 is_tabular_hint = True
 
-            doc_text = self.ingest_fn(
-                path=file_path,
-                document_id=str(document.id),
-                source_type=doc_source_type,
-                is_tabular=is_tabular_hint,
+            cancel_evt = self._active_heartbeat._fenced if self._active_heartbeat else None
+            supports_cancellation = self._callable_supports_cancellation(self.ingest_fn)
+
+            # Check whether cancellation event is already set before invoking ingestion callable
+            if cancel_evt is not None and cancel_evt.is_set():
+                raise StaleWorkerFencedError(
+                    f"Worker {self.worker_id} lease lost before starting OCR stage."
+                )
+
+            # Policy: If _active_heartbeat exists, cancellation support is mandatory before invoking
+            # ingestion, regardless of whether the lease has already been lost.
+            cancellation_required = (
+                self._active_heartbeat is not None
+                or getattr(self, "require_cancellation_support", False)
             )
+
+            if cancellation_required and not supports_cancellation:
+                raise StaleWorkerFencedError(
+                    f"Worker {self.worker_id} has active lease heartbeat or cancellation required, "
+                    f"but ingestion callable '{getattr(self.ingest_fn, '__name__', repr(self.ingest_fn))}' "
+                    f"does not support cancellation_event (cancellation support is mandatory)."
+                )
+
+            if supports_cancellation:
+                doc_text = self.ingest_fn(
+                    path=file_path,
+                    document_id=str(document.id),
+                    source_type=doc_source_type,
+                    is_tabular=is_tabular_hint,
+                    cancellation_event=cancel_evt,
+                )
+            else:
+                doc_text = self.ingest_fn(
+                    path=file_path,
+                    document_id=str(document.id),
+                    source_type=doc_source_type,
+                    is_tabular=is_tabular_hint,
+                )
         except Exception as exc:
             duration_ms = int((time.monotonic() - start_time) * 1000)
             sanitized_err = self._sanitize_error(exc, sensitive_elements)
@@ -639,6 +928,10 @@ class DocumentProcessingWorker:
                 duration_ms=duration_ms,
                 error_message=sanitized_err,
             )
+            if cancel_evt is not None and cancel_evt.is_set() and not isinstance(exc, StaleWorkerFencedError):
+                raise StaleWorkerFencedError(
+                    f"Worker {self.worker_id} lease lost during OCR stage: {exc}"
+                ) from exc
             raise
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -781,20 +1074,39 @@ class DocumentProcessingWorker:
                     c_uuid = uuid.uuid4()
                     contract_claim.claim_id = str(c_uuid)
 
+                grp_id = contract_claim.group_id or contract_claim.region_id or "default"
+                is_unanchored = (
+                    grp_id in (NO_ANCHOR_SENTINEL, "__unanchored_review__")
+                    or getattr(contract_claim, "orphan", False)
+                    or getattr(contract_claim, "unanchored", False)
+                    or getattr(contract_claim, "association_status", "") == AssociationStatus.UNANCHORED_ORPHAN.value
+                )
+                if is_unanchored:
+                    grp_id = "__unanchored_review__"
+                    review_state = ClaimReviewState.ESCALATED
+                else:
+                    review_state = ClaimReviewState.PENDING
+
+                claim_payload = contract_claim.model_dump(mode="json")
+                if is_unanchored:
+                    claim_payload["review_reason"] = "unanchored_medication_attribute"
+                    claim_payload["unanchored"] = True
+                    claim_payload["escalated"] = True
+
                 db_claim = Claim(
                     claim_id=c_uuid,
                     document_id=document.id,
-                    group_id=contract_claim.group_id or contract_claim.region_id or "default",
+                    group_id=grp_id,
                     field_type=contract_claim.field_type,
                     value=contract_claim.value,
                     normalized_code=contract_claim.normalized_code,
                     code_system=contract_claim.code_system,
                     version=1,
                     origin=ClaimOrigin.PIPELINE,
-                    review_state=ClaimReviewState.PENDING,
+                    review_state=review_state,
                     evidence_id=contract_to_db_evidence.get(contract_claim.evidence_id),
                     model_run_id=model_run.id if model_run else None,
-                    payload=contract_claim.model_dump(mode="json"),
+                    payload=claim_payload,
                 )
                 session.add(db_claim)
             session.flush()
@@ -869,6 +1181,19 @@ class DocumentProcessingWorker:
             document.patient_context_id,
         ]
 
+        # Check for terminology database hot-reload at bounded job boundary (Phase 3D.3)
+        if self.terminology_service is not None:
+            try:
+                reloaded = self.terminology_service.reload_if_updated()
+                if reloaded:
+                    logger.info(
+                        "TerminologyRetrievalService reloaded updated release '%s' at job boundary (job_id=%s)",
+                        self.terminology_service.db_version,
+                        job.id,
+                    )
+            except Exception as e:
+                logger.error("Error during job-boundary terminology reload check: %s", e)
+
         try:
             # 1. Fetch existing pipeline claims for this document
             db_claims = (
@@ -928,6 +1253,10 @@ class DocumentProcessingWorker:
                     if candidates:
                         payload["candidates"] = candidates
 
+                    reasons = self.normalizer.get_audit_reasons(norm_claim.claim_id)
+                    if reasons:
+                        payload["abstention_reasons"] = reasons
+
                     db_claim.payload = payload
 
             session.flush()
@@ -944,6 +1273,11 @@ class DocumentProcessingWorker:
                 error_message=sanitized_err,
             )
             raise
+        finally:
+            if hasattr(self.normalizer, "clear_audit_state"):
+                self.normalizer.clear_audit_state()
+            elif hasattr(self.normalizer, "clear_audit_candidates"):
+                self.normalizer.clear_audit_candidates()
 
         duration_ms = int((time.monotonic() - start_time) * 1000)
 
@@ -1210,7 +1544,257 @@ class DocumentProcessingWorker:
         normalized_claims: Any,
         verification_output: Any,
     ) -> None:
-        """Stage 5: Relational persistence boundary."""
+        """Stage 5: Relational persistence and consistency verification boundary."""
         job.current_stage = "PERSISTENCE"
         session.flush()
-        # Full implementation wired in subsequent step
+
+        start_time = time.monotonic()
+        sensitive_elements = [
+            document.original_filename,
+            document.patient_context_id,
+        ]
+
+        self.queue.record_stage_event(
+            session=session,
+            job_id=job.id,
+            stage_name="PERSISTENCE",
+            status="STARTED",
+        )
+
+        try:
+            # 1. Consistency check: verify persisted claims and verifications
+            db_claims = (
+                session.query(Claim)
+                .filter(Claim.document_id == document.id)
+                .all()
+            )
+            claim_ids = [c.id for c in db_claims]
+            db_vrs = (
+                session.query(VerificationResult)
+                .filter(VerificationResult.claim_id.in_(claim_ids))
+                .all()
+                if claim_ids else []
+            )
+
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            metrics = {
+                "num_claims_persisted": len(db_claims),
+                "num_verifications_persisted": len(db_vrs),
+                "num_unanchored_claims": sum(1 for c in db_claims if c.group_id == "__unanchored_review__"),
+            }
+
+            self.queue.record_stage_event(
+                session=session,
+                job_id=job.id,
+                stage_name="PERSISTENCE",
+                status="COMPLETED",
+                duration_ms=duration_ms,
+                metrics=metrics,
+            )
+            session.flush()
+
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - start_time) * 1000)
+            sanitized_err = self._sanitize_error(exc, sensitive_elements)
+            self.queue.record_stage_event(
+                session=session,
+                job_id=job.id,
+                stage_name="PERSISTENCE",
+                status="FAILED",
+                duration_ms=duration_ms,
+                error_message=sanitized_err,
+            )
+            raise
+
+
+class DocumentProcessingDaemon:
+    """Production background processing daemon for clinical document pipeline.
+
+    Orchestrates continuous queue polling, periodic lease reaper cycles,
+    graceful shutdown via SIGTERM/SIGINT, and child subprocess management.
+    """
+
+    def __init__(
+        self,
+        worker: DocumentProcessingWorker,
+        session_factory: Callable[[], Session],
+        poll_interval: float = 1.0,
+        max_backoff: float = 10.0,
+        reaper_interval: float = 30.0,
+    ) -> None:
+        self.worker = worker
+        self.session_factory = session_factory
+        self.poll_interval = poll_interval
+        self.max_backoff = max_backoff
+        self.reaper_interval = reaper_interval
+        self._stop_requested = threading.Event()
+        self._active_subprocesses: set[Any] = set()
+        self._last_reaper_time: float = 0.0
+
+    def register_subprocess(self, proc: Any) -> None:
+        """Register a spawned child subprocess for graceful lifecycle management."""
+        self._active_subprocesses.add(proc)
+
+    def deregister_subprocess(self, proc: Any) -> None:
+        """Deregister a child subprocess that exited normally."""
+        self._active_subprocesses.discard(proc)
+
+    def reap_subprocesses(self, timeout: float = 5.0) -> None:
+        """Terminate and reap all tracked child subprocesses on shutdown."""
+        for proc in list(self._active_subprocesses):
+            try:
+                if hasattr(proc, "poll") and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=timeout)
+                    except Exception:
+                        if hasattr(proc, "kill"):
+                            proc.kill()
+                            proc.wait(timeout=2.0)
+            except Exception as e:
+                logger.warning("Error terminating child subprocess: %s", e)
+            finally:
+                self._active_subprocesses.discard(proc)
+
+    def stop(self) -> None:
+        """Signal the daemon loop to stop gracefully."""
+        self._stop_requested.set()
+        self.reap_subprocesses()
+        if hasattr(self.worker, "close"):
+            self.worker.close()
+
+    def run_single_iteration(self) -> bool:
+        """Execute a single reaper check, queue poll, and job processing pass.
+
+        Returns True if a job was claimed and processed, False otherwise.
+        """
+        now = time.monotonic()
+        if now - self._last_reaper_time >= self.reaper_interval:
+            with self.session_factory() as sess:
+                try:
+                    reclaimed = self.worker.queue.reclaim_expired_leases(sess)
+                    if reclaimed:
+                        sess.commit()
+                        logger.info("Reclaimed %d expired job leases", len(reclaimed))
+                except Exception as e:
+                    sess.rollback()
+                    logger.error("Error running queue lease reaper: %s", e)
+            self._last_reaper_time = now
+
+        with self.session_factory() as sess:
+            claimed_job = self.worker.claim_job(sess)
+            if claimed_job is None:
+                return False
+            sess.commit()
+            job_id = claimed_job.id
+
+        # Process claimed job
+        with self.session_factory() as sess:
+            job = sess.get(ProcessingJob, job_id)
+            if job is None:
+                return False
+            try:
+                self.worker.daemon = self
+                self.worker.process_job(sess, job)
+                sess.commit()
+                return True
+            except StaleWorkerFencedError as fe:
+                sess.rollback()
+                logger.warning("Job %s processing aborted: worker fenced out (%s)", job.id, fe)
+                return False
+            except Exception as e:
+                sess.rollback()
+                logger.error("Job %s failed with exception: %s", job.id, e)
+                return False
+
+    def run(self) -> None:
+        """Continuous execution loop with exponential backoff and graceful shutdown."""
+        backoff = self.poll_interval
+
+        # Setup signal handlers if running in main thread
+        try:
+            import signal
+
+            def _signal_handler(signum, frame):
+                logger.info("Received signal %s; requesting graceful shutdown", signum)
+                self.stop()
+
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+        except (ValueError, AttributeError):
+            pass
+
+        logger.info("DocumentProcessingDaemon started with worker %s", self.worker.worker_id)
+        while not self._stop_requested.is_set():
+            try:
+                processed = self.run_single_iteration()
+                if processed:
+                    backoff = self.poll_interval
+                else:
+                    self._stop_requested.wait(backoff)
+                    backoff = min(backoff * 1.5, self.max_backoff)
+            except Exception as e:
+                logger.exception("Unexpected error in daemon iteration: %s", e)
+                self._stop_requested.wait(backoff)
+
+        self.reap_subprocesses()
+        logger.info("DocumentProcessingDaemon shutdown complete.")
+
+
+class OutboxDispatchWorker:
+    """Background worker daemon thread/loop for dispatching transactional EHR outbox intents (Phase B1)."""
+
+    def __init__(
+        self,
+        outbox_service: Any,
+        worker_id: Optional[str] = None,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        self.outbox_service = outbox_service
+        self.worker_id = worker_id or f"outbox-worker-{uuid.uuid4().hex[:8]}"
+        self.poll_interval_seconds = poll_interval_seconds
+        self._running = False
+
+    def run_single_iteration(self) -> bool:
+        """Execute a single claim, dispatch, and reaper cycle."""
+        # 1. First run reaper cycle to recover any expired leases
+        try:
+            self.outbox_service.run_reaper_cycle()
+        except Exception as exc:
+            logger.error("Outbox reaper cycle encountered error: %s", exc)
+
+        # 2. Claim next pending outbox intent
+        claimed_outbox = self.outbox_service.claim_next_outbox_intent(worker_id=self.worker_id)
+        if not claimed_outbox:
+            return False
+
+        # 3. Process claimed outbox intent
+        return self.outbox_service.process_outbox_intent(
+            outbox_id=claimed_outbox.id,
+            claimed_worker_id=self.worker_id,
+            claimed_generation=claimed_outbox.lease_generation,
+        )
+
+
+def main() -> None:
+    """Daemon configuration validation and execution entrypoint for background document processing worker."""
+    profile = validate_daemon_profile("Background Worker")
+    logger.info("Starting Background Document Processing Worker with profile: %s", profile.value)
+
+    from clindoc.api.auth.dependencies import _GLOBAL_SESSION_FACTORY
+    if _GLOBAL_SESSION_FACTORY is None:
+        logger.warning("Session factory not initialized; worker daemon starting in standalone mode.")
+        return
+
+    from clindoc.terminology.service import reset_process_terminology_service
+    try:
+        worker = DocumentProcessingWorker(session_factory=_GLOBAL_SESSION_FACTORY)
+        daemon = DocumentProcessingDaemon(worker=worker, session_factory=_GLOBAL_SESSION_FACTORY)
+        daemon.run()
+    finally:
+        reset_process_terminology_service()
+
+
+if __name__ == "__main__":
+    main()
+

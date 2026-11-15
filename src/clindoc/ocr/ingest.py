@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 from typing import Any, Literal, Optional, Sequence
 import pymupdf
 
@@ -18,6 +19,7 @@ from clindoc.ocr.document_text import (
 from clindoc.ocr.born_digital import extract_born_digital_pdf
 from clindoc.ocr.schema import DocumentOCRRecord
 from clindoc.m2.context import reconstruct_canonical_page_text
+from clindoc.ocr.hybrid import ModalityConfig
 
 SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".tiff", ".tif", ".txt", ".docx"}
 
@@ -406,7 +408,10 @@ def ingest_document(
     is_tabular: bool | None = None,
     ocr_cache_dir: str | Path | None = None,
     force: bool = False,
-    dpi: int = 150,
+    dpi: int = 300,
+    ocr_engine: str = "tesseract",
+    modality_config: ModalityConfig | None = None,
+    cancellation_event: threading.Event | None = None,
 ) -> DocumentText:
     """Canonical Ingestion API: Convert clinical PDF, DOCX, TXT or image into DocumentText.
 
@@ -417,7 +422,10 @@ def ingest_document(
       is_tabular: Optional override for tabular row grouping (auto-detected if None).
       ocr_cache_dir: Optional custom OCR cache directory.
       force: If True, recomputes extraction ignoring existing cache.
-      dpi: Rasterization DPI for scanned PDFs (default 150).
+      dpi: Rasterization DPI for scanned PDFs (default 300).
+      ocr_engine: OCR engine ('tesseract' or 'paddleocr'). Defaults to 'tesseract'.
+      modality_config: Optional ModalityConfig for custom char count/area thresholds.
+      cancellation_event: Optional threading.Event to abort OCR processing on lease loss.
 
     Returns:
       Canonical DocumentText object conforming to schemas/document_text.json.
@@ -430,6 +438,9 @@ def ingest_document(
       OCREngineError: If OCR processing fails.
     """
     file_path = Path(path)
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise TimeoutError("Document ingestion aborted: cancellation event is already set")
+
     if not file_path.exists():
         raise FileNotFoundError(f"Document file does not exist: {file_path}")
 
@@ -472,11 +483,13 @@ def ingest_document(
         if num_pages == 0:
             raise EmptyDocumentError(f"PDF document {file_path} contains 0 pages")
 
-        # Determine modality if auto
+        # Determine modality if auto: only purely born-digital documents skip OCR pipeline
         resolved_source_type = source_type
         if source_type == "auto":
-            has_digital_text = any(bool(page.get_text().strip()) for page in pdf_doc)
-            resolved_source_type = "born_digital" if has_digital_text else "scanned_image"
+            from clindoc.ocr.hybrid import detect_page_modality, PageModality
+            page_mods = [detect_page_modality(p, config=modality_config) for p in pdf_doc]
+            all_digital = all(m == PageModality.BORN_DIGITAL for m in page_mods)
+            resolved_source_type = "born_digital" if all_digital else "scanned_image"
 
         if resolved_source_type == "born_digital":
             # Direct born-digital extraction via PyMuPDF
@@ -503,21 +516,25 @@ def ingest_document(
             return doc_text
 
         else:
-            # Scanned / rasterized PDF: delegate to PaddleOCR pipeline
+            # Scanned / hybrid PDF: delegate to OCR pipeline (Tesseract default, PaddleOCR fallback)
             try:
                 from clindoc.ocr.pipeline import process_document
                 out_dir = custom_cache_p or Path("data/ocr_cache")
                 ocr_rec = process_document(
                     input_path=file_path,
                     output_dir=out_dir,
-                    engine="paddleocr",
-                    use_born_digital=False,
+                    engine=ocr_engine,
+                    use_born_digital=(source_type != "scanned_image"),
                     force=force,
                     dpi=dpi,
+                    modality_config=modality_config,
+                    cancellation_event=cancellation_event,
                 )
                 return ingest_from_record(ocr_rec, doc_id=doc_id, is_tabular=is_tabular)
             except Exception as e:
-                raise OCREngineError(f"PaddleOCR execution failed on {file_path}: {e}") from e
+                if cancellation_event is not None and cancellation_event.is_set():
+                    raise
+                raise OCREngineError(f"OCR execution failed on {file_path}: {e}") from e
 
     else:
         # Non-PDF image document (.png, .jpg, etc.): OCR processing
@@ -527,13 +544,16 @@ def ingest_document(
             ocr_rec = process_document(
                 input_path=file_path,
                 output_dir=out_dir,
-                engine="paddleocr",
+                engine=ocr_engine,
                 use_born_digital=False,
                 force=force,
                 dpi=dpi,
+                cancellation_event=cancellation_event,
             )
             return ingest_from_record(ocr_rec, doc_id=doc_id, is_tabular=is_tabular)
         except Exception as e:
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise
             raise OCREngineError(f"OCR execution failed on image {file_path}: {e}") from e
 
 

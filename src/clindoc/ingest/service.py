@@ -409,6 +409,7 @@ class DocumentIngestionService:
         uploaded_by: uuid.UUID,
         declared_mime_type: Optional[str] = None,
         patient_context_id: Optional[str] = None,
+        supersedes_id: Optional[uuid.UUID] = None,
         commit: bool = True,
     ) -> Document:
         """Execute full upload screening, deduplication, encrypted storage, and persistence.
@@ -458,6 +459,7 @@ class DocumentIngestionService:
             status=screening.status,
             patient_context_id=patient_context_id,
             duplicate_of=duplicate_of,
+            supersedes_id=supersedes_id,
         )
         session.add(document)
         if commit:

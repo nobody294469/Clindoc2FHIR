@@ -16,10 +16,12 @@ Implements:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any, List, Optional
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from clindoc.config import (
@@ -182,6 +184,58 @@ class JobQueue:
         job.lease_expires_at = now + timedelta(seconds=dur)
         session.flush()
         return job
+
+    def renew_lease(
+        self,
+        session: Session,
+        job_id: uuid.UUID,
+        worker_id: str,
+        claimed_attempts: int,
+        lease_seconds: Optional[int] = None,
+        reference_time: Optional[datetime] = None,
+        max_retries: int = 3,
+    ) -> bool:
+        """Atomically renew lease for an actively running job using CAS fencing.
+
+        CAS Predicate:
+          - id == job_id
+          - worker_id == worker_id
+          - attempts == claimed_attempts
+          - status == JobStatus.RUNNING
+          - lease_expires_at > now  (NEVER revives an expired lease)
+
+        Returns True if lease was successfully extended, False if fenced out (zero rows updated).
+        Retries transient SQLite lock contention with bounded backoff.
+        """
+        dur = lease_seconds if (lease_seconds is not None and lease_seconds > 0) else self.default_lease_seconds
+
+        for attempt in range(max_retries + 1):
+            now = reference_time or datetime.now(timezone.utc)
+            new_expiry = now + timedelta(seconds=dur)
+            try:
+                stmt = (
+                    update(ProcessingJob)
+                    .where(
+                        ProcessingJob.id == job_id,
+                        ProcessingJob.worker_id == worker_id,
+                        ProcessingJob.attempts == claimed_attempts,
+                        ProcessingJob.status == JobStatus.RUNNING,
+                        ProcessingJob.lease_expires_at > now,
+                    )
+                    .values(lease_expires_at=new_expiry)
+                )
+                result = session.execute(stmt)
+                session.flush()
+                return bool(result.rowcount > 0)
+            except OperationalError as oe:
+                err_str = str(oe).lower()
+                is_lock = "locked" in err_str or "busy" in err_str
+                if is_lock and attempt < max_retries:
+                    session.rollback()
+                    time.sleep(0.05 * (2 ** attempt))
+                    continue
+                session.rollback()
+                raise
 
     def mark_completed(self, session: Session, job_id: uuid.UUID) -> ProcessingJob:
         """Mark an actively running job as COMPLETED (terminal state).

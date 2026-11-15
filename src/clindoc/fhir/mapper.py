@@ -75,6 +75,14 @@ from clindoc.verify.schema import (
 )
 
 
+class FHIRExportIdentityError(ValueError):
+    """Raised when FHIR bundle generation encounters missing, synthetic, or unauthorized patient identity."""
+
+
+class FHIRExportValidationError(ValueError):
+    """Raised when FHIR bundle generation encounters invalid, unanchored, or contradictory clinical claims."""
+
+
 def _sanitize_id(val: str) -> str:
     """Sanitize strings into valid FHIR resource IDs (letters, digits, dots, dashes; <= 64 chars)."""
     clean = re.sub(r"[^A-Za-z0-9\-\.]", "-", val.strip())
@@ -1228,73 +1236,12 @@ PANEL_LOINC_MAP: dict[str, tuple[str, str]] = {
 }
 
 
-def select_deterministic_slot_candidate(
-    candidates: Sequence[Claim],
-    verification_map: dict[str, VerificationResult],
-    field_slot: str,
-    group_id: str,
-    audit_trail: Optional[list[dict[str, Any]]] = None,
-) -> tuple[Optional[Claim], list[dict[str, Any]]]:
-    """Select a single candidate deterministically when multiple supported candidates compete for a slot.
-
-    Authority: Phase 4.4 §2, Phase 5.2.3 Sub-Milestone 4.3
-    Rules:
-      1. Human review status: ACCEPTED / EDITED > PENDING / None > REJECTED / ESCALATED.
-      2. Verification verdict: SUPPORTED / VERIFIED > INSUFFICIENT_EVIDENCE > DISCREPANCY > REFUTED.
-      3. Verification confidence (descending).
-      4. Extraction confidence (descending).
-      5. Deterministic tie-breaker: claim_id lexicographical ascending.
-
-    Never silently discard competing candidates. Non-selected candidates are preserved
-    in the audit trail and returned as shadowed records. Supports slot-specific resolution
-    within split regimens and tapers (e.g., med.dose.morning, med.dose.bedtime).
-    """
-    if not candidates:
-        return None, []
-
-    if len(candidates) == 1:
-        return candidates[0], []
-
-    def candidate_sort_key(c: Claim) -> tuple:
-        ver = verification_map.get(c.claim_id)
-        rev_state = (
-            (c.review_state.value if hasattr(c.review_state, "value") else str(c.review_state)).upper()
-            if hasattr(c, "review_state") and c.review_state
-            else None
-        )
-        rev_score = 3 if rev_state in ("ACCEPTED", "EDITED") else (0 if rev_state in ("REJECTED", "ESCALATED") else 2)
-
-        lbl = str(getattr(ver, "label", "")).upper() if ver else ""
-        ver_score = 3 if lbl in ("SUPPORTED", "VERIFIED") else (2 if lbl == "INSUFFICIENT_EVIDENCE" else (1 if lbl == "DISCREPANCY" else 0))
-
-        ver_conf = float(getattr(ver, "confidence", 0.0) or 0.0) if ver else 0.0
-        ext_conf = float(getattr(c, "extraction_confidence", 0.0) or 0.0)
-
-        # Lower tuple value sorts first in ascending sort
-        return (-rev_score, -ver_score, -ver_conf, -ext_conf, c.claim_id)
-
-    sorted_candidates = sorted(candidates, key=candidate_sort_key)
-    selected = sorted_candidates[0]
-    shadowed_records: list[dict[str, Any]] = []
-
-    for other in sorted_candidates[1:]:
-        o_ver = verification_map.get(other.claim_id)
-        s_rec = {
-            "group_id": group_id,
-            "slot": field_slot,
-            "selected_claim_id": selected.claim_id,
-            "selected_value": selected.value,
-            "competing_claim_id": other.claim_id,
-            "competing_value": other.value,
-            "competing_confidence": float(o_ver.confidence) if o_ver else 0.0,
-            "competing_label": str(o_ver.label) if o_ver else "UNVERIFIED",
-            "selection_reason": "Selected candidate has higher review/verification priority, confidence, or deterministic tie-break",
-        }
-        shadowed_records.append(s_rec)
-        if audit_trail is not None:
-            audit_trail.append(s_rec)
-
-    return selected, shadowed_records
+from clindoc.fhir.selection import (
+    CanonicalVerificationVerdict,
+    are_clinically_equivalent,
+    normalize_verification_verdict,
+    select_deterministic_slot_candidate,
+)
 
 
 def _match_authentic_panel_header(text: str) -> Optional[re.Match]:
@@ -1931,9 +1878,40 @@ def _build_regimen_dosages(
         route_ext = build_element_provenance_extension(route_claim, r_ver, r_ev) if (r_ver and r_ev) else None
         route_cc = CodeableConcept(text=route_claim.value, extension=[route_ext] if route_ext else None)
 
+    # Filter dose claims by temporal status if current/active and discontinued coexist
+    active_doses = [
+        c for c in dose_claims
+        if getattr(c, "temporal_status", "current") in ("current", "active", "unspecified", None)
+    ]
+    discontinued_doses = [
+        c for c in dose_claims
+        if getattr(c, "temporal_status", None) in ("discontinued", "historical", "stopped")
+    ]
+    if active_doses and discontinued_doses:
+        effective_dose_claims = active_doses
+        disc_shadowed = [
+            {
+                "group_id": grp_key,
+                "slot": "med.dose",
+                "selected_claim_id": active_doses[0].claim_id,
+                "selected_value": active_doses[0].value,
+                "competing_claim_id": d.claim_id,
+                "competing_value": d.value,
+                "competing_confidence": float(getattr(verification_map.get(d.claim_id), "confidence", 0.0) or 0.0),
+                "competing_label": str(getattr(verification_map.get(d.claim_id), "label", "UNVERIFIED")),
+                "selection_reason": "Historical/discontinued dose excluded from active medication order",
+            }
+            for d in discontinued_doses
+        ]
+        if audit_trail is not None:
+            audit_trail.extend(disc_shadowed)
+    else:
+        effective_dose_claims = dose_claims
+        disc_shadowed = []
+
     # Base case: 0 or 1 dose claim
-    if len(dose_claims) <= 1:
-        dose_claim = dose_claims[0] if dose_claims else None
+    if len(effective_dose_claims) <= 1:
+        dose_claim = effective_dose_claims[0] if effective_dose_claims else None
         freq_claim, freq_shadowed = select_deterministic_slot_candidate(
             freq_claims, verification_map, field_slot="med.frequency", group_id=grp_key, audit_trail=audit_trail
         )
@@ -1969,7 +1947,7 @@ def _build_regimen_dosages(
         else:
             dur_claim = None
             dur_shadowed = []
-        shadowed = freq_shadowed + dur_shadowed
+        shadowed = freq_shadowed + dur_shadowed + disc_shadowed
 
         dose_ext = None
         if dose_claim:
@@ -2208,6 +2186,7 @@ def _build_regimen_dosages(
         for idx, (pos, d) in enumerate(dose_spans):
             next_pos = dose_spans[idx + 1][0] if idx + 1 < len(dose_spans) else len(full_grp_text)
             window_txt = full_grp_text[pos:next_pos]
+            pre_txt = full_grp_text[max(0, pos - 40):pos]
 
             closest_freq = None
             if sorted_freqs:
@@ -2218,7 +2197,10 @@ def _build_regimen_dosages(
                     closest_freq = min(sorted_freqs, key=lambda f: abs(_get_claim_pos(f, full_grp_text, evidence_map) - d_off))
 
             freq_val = closest_freq.value if closest_freq else ""
-            combined_window = f"{window_txt} {freq_val}"
+            if re.search(r"\((?:alternate\s+ocr|or|alt):?\s*$", pre_txt, re.IGNORECASE):
+                combined_window = f"{pre_txt} {window_txt} {freq_val}"
+            else:
+                combined_window = f"{window_txt} {freq_val}"
 
             if MORNING_REGEX.search(combined_window) and not BEDTIME_REGEX.search(combined_window):
                 morning_doses.append(d)
@@ -2319,6 +2301,14 @@ def _build_regimen_dosages(
         sorted_durs, verification_map, field_slot="med.duration", group_id=grp_key, audit_trail=audit_trail
     )
     shadowed = dose_shad + freq_shad + dur_shad
+
+    # Fail-closed guard: if dose claims were present but failed closed due to contradiction
+    if not dose_win and sorted_doses:
+        logger.warning(
+            "Medication group '%s' dose candidates failed closed due to contradiction; suppressing dosage.",
+            grp_key,
+        )
+        return [], shadowed
 
     dose_ext = None
     if dose_win:
@@ -2492,6 +2482,8 @@ def claims_to_fhir_bundle(
     review_info: Optional[dict[str, Any]] = None,
     audit_trail: Optional[list[dict[str, Any]]] = None,
     enforce_req44_lifecycle: bool = True,
+    patient_identifier_system: Optional[str] = None,
+    allow_synthetic_identity: Optional[bool] = None,
 ) -> Bundle:
     """Map canonical clinical claims and verifications into a compliant FHIR R4B Bundle.
 
@@ -2558,16 +2550,51 @@ def claims_to_fhir_bundle(
             raise ValueError(f"Unsupported claim field_type: {c.field_type}")
 
     # 3. Patient, Organization, Practitioner (Grounded Author / Reviewer only)
-    pat_id_str = _sanitize_id(patient_id or f"patient-{doc_slug}")
+    from clindoc.config import (
+        CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM,
+        get_allowed_patient_identifier_systems,
+    )
+
+    is_production = os.environ.get("CLINDOC_PROFILE", "dev").strip().lower() in ("production", "prod")
+    synthetic_allowed = allow_synthetic_identity if allow_synthetic_identity is not None else (not is_production)
+
+    if not patient_id or not str(patient_id).strip():
+        if not synthetic_allowed:
+            raise FHIRExportIdentityError(
+                "Export rejected: patient_id is missing or empty. "
+                "Production clinical FHIR export requires a confirmed patient identity."
+            )
+        effective_patient_id = f"SYNTHETIC-PATIENT-{doc_slug.upper()[:12]}"
+        pat_id_str = _sanitize_id(f"patient-{doc_slug}")
+    else:
+        effective_patient_id = str(patient_id).strip()
+        pat_id_str = _sanitize_id(effective_patient_id)
+        if not synthetic_allowed:
+            pat_lower = effective_patient_id.lower()
+            if pat_lower.startswith("synthetic-patient-") or pat_lower.startswith("patient-"):
+                raise FHIRExportIdentityError(
+                    f"Export rejected: synthetic placeholder patient_id '{effective_patient_id}' "
+                    "is strictly forbidden in clinical exports."
+                )
+
+    target_system = patient_identifier_system or CLINDOC_PRIMARY_PATIENT_IDENTIFIER_SYSTEM
+    if not synthetic_allowed:
+        allowed_systems = get_allowed_patient_identifier_systems()
+        if target_system not in allowed_systems:
+            raise FHIRExportIdentityError(
+                f"Export rejected: patient identifier system '{target_system}' "
+                f"is not in allowed systems {allowed_systems}."
+            )
+
     patient = Patient(
         id=pat_id_str,
         identifier=[
             Identifier(
-                system=IDENTIFIER_MRN_SYSTEM,
-                value=patient_id or f"SYNTHETIC-PATIENT-{doc_slug.upper()[:12]}",
+                system=target_system,
+                value=effective_patient_id,
             )
         ],
-        name=[HumanName(text=patient_name or "Synthetic Patient")],
+        name=[HumanName(text=patient_name or ("Synthetic Patient" if synthetic_allowed else "Verified Patient"))],
     )
 
     org_id_str = f"org-{doc_slug}"
@@ -2716,6 +2743,17 @@ def claims_to_fhir_bundle(
                     "group_id": grp_key,
                     "status": "SUPPRESSED",
                     "reason": "Malformed group: lacks both test name and value claims",
+                })
+            continue
+
+        # Observation value constraint: atomic observation cannot be emitted without value
+        if not val_claim:
+            logger.warning("Lab group '%s' has no valid/selected value claim; suppressing observation.", grp_key)
+            if audit_trail is not None:
+                audit_trail.append({
+                    "group_id": grp_key,
+                    "status": "SUPPRESSED",
+                    "reason": "Observation suppressed: no valid or resolved value claim",
                 })
             continue
 
@@ -3048,7 +3086,7 @@ def claims_to_fhir_bundle(
             audit_trail=audit_trail,
         )
 
-        if grp_key == "__no_anchor__" or grp_key.startswith("__no_anchor"):
+        if grp_key in ("__unanchored_review__", "__no_anchor__") or grp_key.startswith("__unanchored") or grp_key.startswith("__no_anchor"):
             logger.warning("Medication group '%s' is an unanchored orphan group; skipping.", grp_key)
             if audit_trail is not None:
                 audit_trail.append({
@@ -3059,13 +3097,13 @@ def claims_to_fhir_bundle(
             continue
 
         has_any_dose = any(c.field_type == "med.dose" for c in grp)
-        if not name_claim and not has_any_dose:
-            logger.warning("Medication group '%s' has neither medication name nor dose claim; skipping malformed group.", grp_key)
+        if not name_claim:
+            logger.warning("Medication group '%s' lacks resolved medication name claim; suppressing medication resource.", grp_key)
             if audit_trail is not None:
                 audit_trail.append({
                     "group_id": grp_key,
                     "status": "SUPPRESSED",
-                    "reason": "Malformed group: lacks both medication name and dose claims",
+                    "reason": "Medication resource suppressed: lacks resolved medication name claim",
                 })
             continue
 
@@ -3078,6 +3116,19 @@ def claims_to_fhir_bundle(
             grp_key=grp_key,
             audit_trail=audit_trail,
         )
+
+        if not dosages and has_any_dose:
+            logger.warning(
+                "Medication group '%s' has dose claims but resolved to zero valid dosages; suppressing medication resource.",
+                grp_key,
+            )
+            if audit_trail is not None:
+                audit_trail.append({
+                    "group_id": grp_key,
+                    "status": "SUPPRESSED",
+                    "reason": "Medication resource suppressed: unresolved conflicting dose candidates failed closed",
+                })
+            continue
 
         grp_med_shadowed = name_shadowed + route_shadowed + dosage_shadowed
 
