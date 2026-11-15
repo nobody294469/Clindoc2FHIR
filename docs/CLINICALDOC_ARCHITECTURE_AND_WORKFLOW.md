@@ -358,6 +358,30 @@ This workflow dispatches the cryptographically signed bundle across hospital net
 
 ---
 
+### 3.5 Workflow E: Transactional Outbox & Asynchronous Dispatch (Phase B1)
+- **Status**: Technically Complete; Dedicated Test Suite Passing (November 2026)
+- **Verification Result**: 14 passed, 0 failed, 0 skipped in dedicated outbox suite (13 SQLite-focused unit/recovery tests and 1 live PostgreSQL 18 migration/concurrency test in tests/test_phase_b_milestone1_outbox.py)
+- **Core Architecture & Invariants**:
+  - **Dedicated Outbox Model**: `ehr_transmission_outbox` with intent deduplication via composite unique constraint `(document_id, destination_identity, bundle_sha256)`.
+  - **Bidirectional Composite Linkage**:
+    - Reverse composite FK: `(current_attempt_id, id) -> fhir_exports(id, outbox_id)` with `ON DELETE RESTRICT`.
+    - Forward composite FK: `(outbox_id, logical_export_id) -> ehr_transmission_outbox(id, logical_export_id)` with `ON DELETE RESTRICT`.
+    - Referenced composite uniqueness: `UNIQUE(id, outbox_id)` on `fhir_exports` and `UNIQUE(id, logical_export_id)` on `ehr_transmission_outbox`.
+    - Database immutability triggers: `fhir_exports.outbox_id` is immutable once assigned.
+  - **Dialect-Specific Hex Constraints**: Check constraints compile to `~ '^[0-9a-f]{64}$'` on PostgreSQL and `NOT GLOB '*[^0-9a-f]*'` on SQLite for `bundle_sha256` and `destination_idempotency_key`.
+  - **Monotonic Lease-Generation Fencing**: Worker claiming via `FOR UPDATE SKIP LOCKED` (PostgreSQL) and `BEGIN IMMEDIATE` (SQLite). State synchronization strictly validates `id`, `status == 'DISPATCHING'`, `lease_generation`, `worker_id`, unexpired lease (`lease_expires_at >= now`), and `current_attempt_id`. Stale workers cannot overwrite newer outcomes.
+  - **Boundary Isolation**: Strictly zero open DB connections during Boundary B physical network transport (`serialize_transport_payload` executed beforehand).
+  - **Crash Recovery Reaper**: Handles Case A (unattempted lease recovery), Cases B/C (`UNKNOWN_RECONCILIATION_REQUIRED` attempt transition and `BLOCKED_RECONCILIATION` outbox state), and Case D (outcome catch-up).
+  - **Decoupled Two-Transaction Retry Workflow**:
+    - Transaction 1: Phase A validates and atomically consumes Four-Eyes reconciliation token while creating next attempt (`attempt_number > 1`, `parent_attempt_id` linked) using dedicated session.
+    - Transaction 2: Staging updates outbox intent to `PENDING` with new `current_attempt_id`.
+  - **Authoritative Phase A Idempotency Derivation**:
+    `SHA256(canonical_destination + ":" + logical_export_id + ":" + canonical_bundle_sha256)`
+    enforcing lowercase/trimmed URL, default port omission (:80, :443), trailing slash removal, strict UUIDv4 validation, and 64-char lowercase hex regex validation.
+  - **Dual-Engine Migration Runner (`20261111_02_phase_b1_outbox`)**: In-transaction version registration, 12-step populated SQLite rebuild with `PRAGMA foreign_keys = OFF` outside transaction, pre-commit `foreign_key_check`, guaranteed restoration to `ON` in `finally`, and pooled connection invalidation on restoration failure.
+
+---
+
 ## 4. Claim Resolution State Machine
 
 During the extraction and review lifecycle, every atomic claim exists in a well-defined state governed by deterministic transition rules:
@@ -391,4 +415,5 @@ To maintain total transparency, the following table explicitly distinguishes ver
 | Gate 9 Signing Gateway | **Fully Implemented** | `src/clindoc/services/fhir_export.py` | Ed25519 private key configuration. |
 | CLI Draft Containment (DEF-004) | **Fully Implemented** | `src/clindoc/cli.py` | None. |
 | Transport Assertions | **Fully Implemented** | `src/clindoc/services/ehr_transport.py` | None. |
+| Transactional Outbox & Dispatch (Phase B1) | **Fully Implemented; Test Suite Passing** (14-test suite: SQLite & PostgreSQL 18) | `src/clindoc/db/models.py`, `src/clindoc/services/outbox_service.py`, `src/clindoc/jobs/worker.py`, `src/clindoc/db/migrations/phase_b1_outbox.py` | PostgreSQL / SQLite database (zero external broker dependencies). |
 | Hospital EHR Integration | **Client Implemented** | `src/clindoc/services/ehr_transport.py` | **External Hospital EHR Server** (Epic/Cerner FHIR endpoint + mTLS certs). |
